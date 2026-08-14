@@ -361,3 +361,9 @@ Dry, understated, specific — one line, no exclamation marks (the flair registe
 ## Round 23 (2026-08-14): the tour
 
 - A 10-step onboarding tour: first run auto-starts it (localStorage-flagged, once); a card follows the pet while it demonstrates — waves hello, walks on ⌘-click, hops the composer ledge, explains missions, treats, fetch, personalities, and the paw button. Skippable (Esc), re-runnable from the menu ("Show me around") or the panel ("Take the tour").
+
+## Round 24 (2026-08-14): launch polish wave one
+
+- Staleness handshake: the overlay notices when the server ships a newer bundle and asks for a window reload — the stale-window class of bug report retires.
+- Retry skipped states in one click from the generation warning; cost hints on every button that spends API money.
+- Ceremony preview from the dev panel; glow-up nudges when art lags the pet's stage; bubbles clamp to the viewport and coexist with the emotion badge; the director now inspects bb chrome (paw button, nav row, pane headers).

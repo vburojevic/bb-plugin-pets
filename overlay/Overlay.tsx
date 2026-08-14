@@ -22,6 +22,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { resolveState, type SpriteState } from "../src/atlas";
+import { EMOTION_LABELS, charGeometry, nextFrame, randomBetween } from "./core";
 import {
   connectSignals,
   currentThreadId,
@@ -123,6 +124,8 @@ const TOUR_AUTOSTART_MS = 2500;
 const SLEEP_AFTER_MS = 10 * 60 * 1000;
 const MOMENT_MS = 2800;
 const BUBBLE_MS = 6500;
+/** Keep-out margin between the speech bubble and either window edge. */
+const BUBBLE_EDGE_PAD = 8;
 const POINT_MS = 4500;
 const AUTO_POINT_COOLDOWN_MS = 3 * 60 * 1000;
 // How long a thread stays "already pointed at" for the auto-pointer.
@@ -167,28 +170,6 @@ const CEREMONY_SILHOUETTE_MS = 900;
 const CEREMONY_REVEAL_MS = 350;
 /** Target on-screen height of the CHARACTER at the centre of the ceremony. */
 const CEREMONY_CHAR_TARGET = 160;
-
-/** Plain-language read-out of the current sprite state (opt-in setting). */
-const EMOTION_LABELS: Record<SpriteState, string> = {
-  idle: "😌 content",
-  walk: "🚶 wandering",
-  run: "🏃 hustling",
-  think: "🤔 thinking",
-  waiting: "⏳ waiting on you",
-  celebrate: "🎉 celebrating",
-  sad: "😞 down",
-  grumpy: "😾 grumpy",
-  sleep: "💤 asleep",
-  wave: "👋 hello",
-  point: "👉 look",
-  love: "❤️ loved",
-  dig: "⛏️ working",
-  jump: "⬆️ boing",
-  startled: "😳 startled",
-  sit: "🪑 perched",
-  stretch: "🙆 stretching",
-  dance: "🕺 dancing",
-};
 
 // --- autonomy director -------------------------------------------------------
 // The pet acts on its own: every so often the director picks ONE act from the
@@ -282,15 +263,6 @@ const IDLE_FRAME_DIVISOR = 4;
 /** States that are allowed to skip frames — none of them move the pet. */
 const IDLE_SKIP_STATES: ReadonlySet<string> = new Set(["idle", "sleep", "sit"]);
 
-// Transition poses must not restart: sleep plays once then loops only its tail
-// (the breathing lives there); sit plays once and holds its final frame.
-const PLAY_MODES: Partial<
-  Record<SpriteState, { mode: "holdLast" } | { mode: "tailLoop"; tailFraction: number }>
-> = {
-  sleep: { mode: "tailLoop", tailFraction: 0.5 },
-  sit: { mode: "holdLast" },
-};
-
 /** djb2 — a stable, cheap string hash. Only used to seed the pet's voice. */
 function djb2(input: string): number {
   let hash = 5381;
@@ -347,8 +319,6 @@ const looseRpc = rpc as unknown as (
   method: string,
   input?: unknown,
 ) => Promise<unknown>;
-
-const randomBetween = (min: number, max: number) => min + Math.random() * (max - min);
 
 const threadRowFor = (threadId: string): Element | null =>
   document.querySelector(`[data-sidebar-thread-id="${CSS.escape(threadId)}"]`);
@@ -744,6 +714,9 @@ export function Overlay({ pluginId }: { pluginId: string }) {
   const [viewedThreadId, setViewedThreadId] = useState<string | null>(currentThreadId());
   const [spriteState, setSpriteState] = useState<SpriteState>("wave");
   const [bubble, setBubble] = useState<BubbleState | null>(null);
+  // Measured placement for the live bubble: which side its tail hangs off, and
+  // the left offset (anchor-relative px) that keeps it inside the window.
+  const [bubbleFit, setBubbleFit] = useState<{ side: "left" | "right"; left: number } | null>(null);
   const [hearts, setHearts] = useState<Particle[]>([]);
   const [sparkles, setSparkles] = useState<Particle[]>([]);
   const [motes, setMotes] = useState<{ id: number; text: string }[]>([]);
@@ -904,6 +877,15 @@ export function Overlay({ pluginId }: { pluginId: string }) {
   const ledgeBoingRef = useRef(0);
   const bubbleVisibleRef = useRef(false);
   const mountedAtRef = useRef(Date.now());
+  // --- staleness handshake ---
+  // The server stamps every getOverlay with the bundle it is serving. The FIRST
+  // successful load pins the stamp this page is running; any later fetch that
+  // reports a different one means the plugin was rebuilt under us, and the
+  // running JS is now the old build. Nudged exactly once per page life.
+  const bundleStampRef = useRef<string | null>(null);
+  const staleShownRef = useRef(false);
+  // The live bubble node, measured so the bubble can be kept on screen.
+  const bubbleElRef = useRef<HTMLButtonElement | null>(null);
   // --- dev feed / perf guardrails ---
   // Label of the director act currently in flight, for the dev feed.
   const currentActRef = useRef<string | null>(null);
@@ -1080,6 +1062,27 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     window.dispatchEvent(new PopStateEvent("popstate"));
   }, []);
 
+  // Staleness handshake. The stamp is added by the server half of this
+  // feature, so it is read through a widened view (same idiom as
+  // extraSettings) and an absent/empty stamp simply never nudges. The first
+  // non-null stamp seen from ANY source (fetch, server boot, fleet) pins the
+  // baseline this page is running.
+  const checkBundleStamp = useCallback(
+    (stamp: unknown) => {
+      if (typeof stamp !== "string" || stamp.length === 0) return;
+      if (bundleStampRef.current === null) {
+        bundleStampRef.current = stamp;
+      } else if (stamp !== bundleStampRef.current && !staleShownRef.current) {
+        staleShownRef.current = true;
+        logDebug("stale", stamp.slice(0, 16));
+        showBubble("i got an update. reload the window (⌘R) to meet the new me.", {
+          important: true,
+        });
+      }
+    },
+    [showBubble],
+  );
+
   const refetch = useCallback(() => {
     return rpc(pluginId, "getOverlay").then((next) => {
       setData(next);
@@ -1098,11 +1101,12 @@ export function Overlay({ pluginId }: { pluginId: string }) {
           pos.yBottom = next.prefs.y;
         }
       }
+      checkBundleStamp((next as { bundleStamp?: unknown }).bundleStamp);
       // Returned so callers that need the FRESH row (the evolution ceremony
       // reads the new stage off it) don't have to race the state update.
       return next;
     });
-  }, [pluginId]);
+  }, [pluginId, checkBundleStamp]);
 
   const refetchQuiet = useCallback(() => {
     void refetch().catch(() => {});
@@ -1623,6 +1627,12 @@ export function Overlay({ pluginId }: { pluginId: string }) {
               setFleet(signal.fleet);
               checkLongRunners(signal.fleet);
             }
+            checkBundleStamp((payload as { bundleStamp?: unknown }).bundleStamp);
+            break;
+          // A plugin reload restarts the server without closing this socket,
+          // so the boot announce is the only stamp that arrives on reload.
+          case "server-boot":
+            checkBundleStamp((payload as { bundleStamp?: unknown }).bundleStamp);
             break;
           case "job":
             jobActiveRef.current = !!(payload as { job?: unknown }).job;
@@ -1748,6 +1758,16 @@ export function Overlay({ pluginId }: { pluginId: string }) {
             }
             break;
           }
+          case "glowup-available":
+            // Fresh artwork for the current stage is available but not applied:
+            // the pet mentions it, and the menu does the rest. Never talks over
+            // a bubble that's already up.
+            if (signal.stageName && !bubbleVisibleRef.current) {
+              showBubble(`i can look like a proper ${signal.stageName} now. glow up is in my menu.`, {
+                important: false,
+              });
+            }
+            break;
           case "treat-earned":
             if (typeof signal.balance === "number") setTreatBalance(signal.balance);
             // Never talk over something the pet is already saying.
@@ -1783,6 +1803,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     burstConfetti,
     burstSparkles,
     celebrateTier,
+    checkBundleStamp,
     checkLongRunners,
     dropTreatAt,
     hop,
@@ -1791,6 +1812,26 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     refetchQuiet,
     showBubble,
   ]);
+
+  // Ceremony preview (dev only — the dev card's button dispatches it). Replays
+  // the set piece with the CURRENT pet, so the thing being previewed is the
+  // thing that would actually appear. A fresh key replaces any ceremony still
+  // on screen rather than stacking a second one.
+  useEffect(() => {
+    const onPreview = () => {
+      const current = dataRef.current?.pet;
+      if (!current) return;
+      logDebug("ceremony", "preview");
+      setCeremony({
+        name: current.name,
+        stageName: current.stage.name,
+        epithet: current.stage.epithet,
+        key: Date.now(),
+      });
+    };
+    window.addEventListener("pets:preview-ceremony", onPreview);
+    return () => window.removeEventListener("pets:preview-ceremony", onPreview);
+  }, []);
 
   // Preload strip images whenever the artwork identity changes.
   const artKey = data?.pet ? `${data.pet.id}:${data.pet.artStage}` : null;
@@ -1960,6 +2001,34 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     if (!bubble) return;
     const timer = setTimeout(() => setBubble(null), Math.max(0, bubble.until - Date.now()));
     return () => clearTimeout(timer);
+  }, [bubble]);
+
+  // Bubble fitting. The bubble hangs off the anchor (which the paint loop
+  // translates to the pet's x), so near either window edge — and on the ledge,
+  // where the pet often stands hard against a pane — the default left:0 /
+  // right:0 placement runs off screen. Measure the rendered bubble once, clamp
+  // its LEFT EDGE into [pad, innerWidth - pad - width], and hand the tail to
+  // whichever side ends up nearer the pet so it still points at the speaker.
+  useLayoutEffect(() => {
+    if (!bubble) {
+      setBubbleFit(null);
+      return;
+    }
+    const el = bubbleElRef.current;
+    if (!el) return;
+    const width = el.getBoundingClientRect().width;
+    const petX = posRef.current.x ?? 0;
+    const petWidth = widthRef.current;
+    const naturalLeft = bubble.side === "left" ? petX : petX + petWidth - width;
+    const minLeft = BUBBLE_EDGE_PAD;
+    const maxLeft = Math.max(minLeft, window.innerWidth - BUBBLE_EDGE_PAD - width);
+    const left = Math.min(Math.max(naturalLeft, minLeft), maxLeft);
+    // Clamped: the tail is no longer under the pet on its original side, so put
+    // it on the end of the bubble the pet is actually closest to.
+    const petCenter = petX + petWidth / 2;
+    const side =
+      left === naturalLeft ? bubble.side : petCenter - left > width / 2 ? "right" : "left";
+    setBubbleFit({ side, left: left - petX });
   }, [bubble]);
 
   // Ring hard-cap: whatever the mission machinery is doing, the highlight can
@@ -2245,23 +2314,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
           frameClockRef.current %= 1;
           const raw = rawFrameRef.current + 1;
           rawFrameRef.current = raw;
-          // `nextState` is the RESOLVED state actually being drawn, so a
-          // fallback pose obeys the play mode of the state it stands in for.
-          const pm = PLAY_MODES[nextState];
-          if (!pm || raw < spec.frames) {
-            frameRef.current =
-              pm && raw < spec.frames
-                ? raw
-                : spec.loop
-                  ? raw % spec.frames
-                  : Math.min(raw, spec.frames - 1);
-          } else if (pm.mode === "holdLast") {
-            frameRef.current = spec.frames - 1;
-          } else {
-            const tailLen = Math.max(1, Math.round(spec.frames * pm.tailFraction));
-            const tailStart = spec.frames - tailLen;
-            frameRef.current = tailStart + ((raw - spec.frames) % tailLen);
-          }
+          frameRef.current = nextFrame(raw, spec, nextState);
           // Footfalls ride the strip, not a timer: every SECOND frame advance
           // of a locomotion pose is a step, so the zoomies/fetch speed boost
           // makes the footsteps quicken for free. `sounds.step()` is itself a
@@ -2289,18 +2342,9 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       const ready = !!img && img.complete && img.naturalWidth > 0;
       const srcCellW = ready ? Math.floor(img.naturalWidth / spec.frames) : spec.width / spec.frames;
       const srcH = ready ? img.naturalHeight : spec.height;
-      // Character-normalized ONCE, against the IDLE pose: one uniform pixel
-      // scale per pet. Measuring the CURRENT pose instead inflated naturally
-      // short poses (sleeping, sitting, digging) back up to standing height,
-      // so the pet visibly ballooned/shrank whenever a reaction changed state.
-      // Anchored to idle, poses differ in height because the POSE differs.
-      const idleSpec = atlas.states[resolveState(atlas.states, "idle")] ?? spec;
-      const refContentH = Math.max(1, idleSpec.contentHeight ?? idleSpec.height);
       const petScale = dataRef.current?.pet?.sizeScale ?? 1;
       const charTarget = BASE_CHAR_HEIGHT * petScale;
-      const pixelScale = charTarget / refContentH;
-      const height = spec.height * pixelScale;
-      const width = srcCellW * pixelScale;
+      const { width, height } = charGeometry(atlas, spec, srcCellW, charTarget);
       widthRef.current = width;
       heightRef.current = height;
       const speedFactor = WALK_SPEEDS[dataRef.current?.settings.walkSpeed ?? "normal"] ?? 1;
@@ -3181,6 +3225,48 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       momentRef.current = { state: "sit", until: Date.now() + 6000 };
     };
 
+    /**
+     * The three bits of bb chrome the pet is allowed to have opinions about:
+     * its own paw button in the sidebar footer, its row in the nav rail, and
+     * whatever pane header is on screen. Anything that isn't there right now is
+     * simply not a candidate.
+     */
+    const landmarks = (): Element[] => {
+      const found: (Element | null | undefined)[] = [
+        document.querySelector('[aria-label="Pets"]') ??
+          document.querySelector("[data-sidebar-footer]"),
+        Array.from(document.querySelectorAll("nav a, nav button, [role='navigation'] a")).find(
+          (el) => (el.textContent ?? "").trim() === "Pets",
+        ),
+        document.querySelector("[role='tablist']") ?? document.querySelector("[data-pane-header]"),
+      ];
+      return found.filter((el): el is Element => {
+        if (!el) return false;
+        const node = el as HTMLElement;
+        if (node.checkVisibility ? !node.checkVisibility() : false) return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+    };
+
+    const inspectChrome = async () => {
+      const targets = landmarks();
+      const target = targets[Math.floor(Math.random() * targets.length)];
+      if (!target) return;
+      const rect = target.getBoundingClientRect();
+      const { width, minX, maxX } = bounds();
+      const center = rect.left + rect.width / 2;
+      walkToClear(Math.min(Math.max(center - width / 2, minX), maxX));
+      if (!(await arrival())) return;
+      facingRef.current = center >= (posRef.current.x ?? 0) + width / 2 ? 1 : -1;
+      // "point" is optional in an atlas; resolveState hands back the nearest
+      // pose it does have, so a thin atlas gets a wave instead of nothing.
+      const states = atlasRef.current?.states;
+      const pose = states ? resolveState(states, "point") : "wave";
+      momentRef.current = { state: pose, until: Date.now() + 1800 };
+      await sleep(1800);
+    };
+
     const danceBreak = async () => {
       momentRef.current = { state: "dance", until: Date.now() + 3000 };
       burstSparkles();
@@ -3220,6 +3306,13 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         run: composerWatch,
       },
       { label: "dance-break", weight: 6, motion: true, enabled: (p) => p.funny, run: danceBreak },
+      {
+        label: "inspect-chrome",
+        weight: 6,
+        motion: true,
+        enabled: (p) => p.cozy || p.funny,
+        run: inspectChrome,
+      },
     ];
 
     const schedule = () => {
@@ -3539,8 +3632,13 @@ export function Overlay({ pluginId }: { pluginId: string }) {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: 4, scale: 0.98 }}
               transition={{ type: "spring", stiffness: 480, damping: 26 }}
+              ref={bubbleElRef}
               aria-hidden="true"
-              className={`pets-bubble pets-bubble-${bubble.side} border border-border bg-card text-card-foreground shadow-md`}
+              className={`pets-bubble pets-bubble-${bubbleFit?.side ?? bubble.side} border border-border bg-card text-card-foreground shadow-md`}
+              // Once measured, the bubble is positioned purely from the left so
+              // the clamp is expressible in one number; until then the side
+              // classes hold it in roughly the right place.
+              style={bubbleFit ? { left: bubbleFit.left, right: "auto" } : undefined}
               onClick={() => {
                 if (bubble.threadId && bubble.projectId) {
                   navigateToThread(bubble.projectId, bubble.threadId);
@@ -3552,7 +3650,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
             </motion.button>
           ) : null}
         </AnimatePresence>
-        {(data.settings.showEmotions ?? false) && !bubble ? (
+        {(data.settings.showEmotions ?? false) ? (
           <AnimatePresence mode="wait">
             <motion.div
               key={spriteState}
@@ -3561,7 +3659,19 @@ export function Overlay({ pluginId }: { pluginId: string }) {
                   ? "border-foreground/40 text-foreground"
                   : "border-border text-muted-foreground"
               }`}
-              style={{ bottom: "calc(100% + 6px)", left: 0, width: "max-content" }}
+              // The badge used to unmount whenever the pet spoke. Instead it
+              // steps aside: a bubble grows away from the pet on its own side,
+              // so the badge tucks against the pet's OPPOSITE flank and the two
+              // never share the same strip of window.
+              style={{
+                bottom: "calc(100% + 6px)",
+                ...(bubble
+                  ? (bubbleFit?.side ?? bubble.side) === "left"
+                    ? { right: "calc(100% + 6px)", left: "auto" }
+                    : { left: "calc(100% + 6px)", right: "auto" }
+                  : { left: 0 }),
+                width: "max-content",
+              }}
               initial={{ opacity: 0, y: 4 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -4 }}

@@ -154,6 +154,11 @@ type Draft = RpcOutput<"listDrafts">["drafts"][number];
 type Stats = RpcOutput<"getStats">;
 type Job = RpcOutput<"getJobStatus">["job"];
 type JobError = RpcOutput<"getJobStatus">["lastError"];
+type QueuedJob = RpcOutput<"getJobStatus">["queued"][number];
+
+/** Generation runs one job at a time with two more allowed to wait behind it;
+ *  only a full queue blocks the buttons that start jobs. */
+const MAX_JOBS = 3;
 
 const PHASE_LABELS: Record<string, string> = {
   drafts: "Drafting candidates for",
@@ -170,18 +175,33 @@ function formatElapsed(since: number): string {
 }
 
 /**
+ * States a generation job gave up on, remembered so the warning can be acted
+ * on rather than merely read. `petId` comes straight from the gen-warning
+ * signal; it is null only for warnings with no pet to retry against.
+ */
+type SkippedCapture = { petId: string | null; states: string[]; subject: string; at: number };
+
+/**
  * The one true progress surface. Jobs run server-side and survive
  * navigation; this banner reattaches to whatever is running (or whatever
  * failed while nobody was looking) on every mount, on every tab.
  */
 function JobBanner({
   job,
+  queued,
   lastError,
   onDismissError,
+  skipped,
+  onRetrySkipped,
+  onDismissSkipped,
 }: {
   job: Job;
+  queued: QueuedJob[];
   lastError: JobError;
   onDismissError: () => void;
+  skipped: SkippedCapture | null;
+  onRetrySkipped: () => void;
+  onDismissSkipped: () => void;
 }) {
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -243,10 +263,25 @@ function JobBanner({
               ? `No progress for ${Math.floor(sinceProgress / 1000)}s — image APIs crawl sometimes; still connected and working.`
               : "Runs on the server — you can leave this page and come back."}
           </p>
+          {/* Everything waiting behind this job, in the order it will run. */}
+          {queued.map((entry) => (
+            <p key={entry.jobId} className="text-xs text-muted-foreground">
+              queued: {entry.subject} ({entry.phase})
+            </p>
+          ))}
         </CardContent>
       </Card>
     );
   }
+
+  // No job is running, so a retry is safe to offer — but only once we know
+  // which pet the skipped states belong to.
+  const retryButton =
+    skipped && skipped.petId ? (
+      <Button size="sm" variant="outline" onClick={onRetrySkipped}>
+        Retry skipped ({skipped.states.length})
+      </Button>
+    ) : null;
 
   if (lastError) {
     return (
@@ -257,7 +292,29 @@ function JobBanner({
         </AlertTitle>
         <AlertDescription className="flex items-center justify-between gap-3">
           <span className="min-w-0 flex-1">{lastError.message}</span>
+          {retryButton}
           <Button size="sm" variant="outline" onClick={onDismissError}>
+            Dismiss
+          </Button>
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  if (skipped) {
+    return (
+      <Alert className="border-amber-500/50">
+        <AlertTitle>
+          Skipped {skipped.states.length} animation{skipped.states.length === 1 ? "" : "s"} for{" "}
+          {skipped.subject}{" "}
+          <span className="font-normal text-muted-foreground">· {timeAgo(skipped.at)}</span>
+        </AlertTitle>
+        <AlertDescription className="flex items-center justify-between gap-3">
+          <span className="min-w-0 flex-1">
+            Fallbacks cover {skipped.states.join(", ")} — retry to draw them properly.
+          </span>
+          {retryButton}
+          <Button size="sm" variant="outline" onClick={onDismissSkipped}>
             Dismiss
           </Button>
         </AlertDescription>
@@ -431,7 +488,7 @@ function LineageStrip({ petId }: { petId: string }) {
 
 /** Per-state repair: pick exactly the animations that came out wrong and
  *  regenerate only those — the rest of the artwork is left untouched. */
-function FixAnimationsPicker({ pet, jobActive }: { pet: Pet; jobActive: boolean }) {
+function FixAnimationsPicker({ pet, queueFull }: { pet: Pet; queueFull: boolean }) {
   const rpc = useRpc<typeof rpcContract>();
   const [open, setOpen] = useState(false);
   const [selection, setSelection] = useState<Set<string>>(new Set());
@@ -465,8 +522,8 @@ function FixAnimationsPicker({ pet, jobActive }: { pet: Pet; jobActive: boolean 
               <Button
                 size="sm"
                 variant="ghost"
-                className={`text-muted-foreground${jobActive ? " pointer-events-none" : ""}`}
-                disabled={jobActive}
+                className={`text-muted-foreground${queueFull ? " pointer-events-none" : ""}`}
+                disabled={queueFull}
               >
                 Fix animations…
               </Button>
@@ -474,8 +531,8 @@ function FixAnimationsPicker({ pet, jobActive }: { pet: Pet; jobActive: boolean 
           </span>
         </TooltipTrigger>
         <TooltipContent>
-          {jobActive
-            ? "A generation job is already running"
+          {queueFull
+            ? "Queue full — wait for a running job to finish"
             : "Regenerate only the animations you pick"}
         </TooltipContent>
       </Tooltip>
@@ -516,7 +573,8 @@ function FixAnimationsPicker({ pet, jobActive }: { pet: Pet; jobActive: boolean 
           </Button>
         </div>
         <p className="text-xs text-muted-foreground">
-          Only the selected animations are regenerated and merged — the rest keep their art.
+          Only the selected animations are regenerated and merged — the rest keep their art. ~$0.25
+          per state.
         </p>
         <Button
           size="sm"
@@ -542,7 +600,7 @@ function FixAnimationsPicker({ pet, jobActive }: { pet: Pet; jobActive: boolean 
   );
 }
 
-function DenTab({ hasApiKey, jobActive }: { hasApiKey: boolean; jobActive: boolean }) {
+function DenTab({ hasApiKey, queueFull }: { hasApiKey: boolean; queueFull: boolean }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [pets, setPets] = useState<Pet[] | null>(null);
@@ -705,8 +763,8 @@ function DenTab({ hasApiKey, jobActive }: { hasApiKey: boolean; jobActive: boole
                           <Button
                             size="sm"
                             variant="ghost"
-                            className={`text-muted-foreground${jobActive ? " pointer-events-none" : ""}`}
-                            disabled={jobActive}
+                            className={`text-muted-foreground${queueFull ? " pointer-events-none" : ""}`}
+                            disabled={queueFull}
                             onClick={() =>
                               void rpc
                                 .call("refreshArt", { petId: pet.id })
@@ -719,13 +777,13 @@ function DenTab({ hasApiKey, jobActive }: { hasApiKey: boolean; jobActive: boole
                         </span>
                       </TooltipTrigger>
                       <TooltipContent>
-                        {jobActive
-                          ? "A generation job is already running"
-                          : "Regenerate every animation through the latest engine at the current pack — upgrades older pets to new animation sets (~a few minutes)"}
+                        {queueFull
+                          ? "Queue full — wait for a running job to finish"
+                          : "Regenerate every animation through the latest engine at the current pack — upgrades older pets to new animation sets (~a few minutes, ~$1–3 depending on pack)"}
                       </TooltipContent>
                     </Tooltip>
                   ) : null}
-                  {hasApiKey ? <FixAnimationsPicker pet={pet} jobActive={jobActive} /> : null}
+                  {hasApiKey ? <FixAnimationsPicker pet={pet} queueFull={queueFull} /> : null}
                   {!pet.active ? (
                     <AlertDialog>
                       <AlertDialogTrigger asChild>
@@ -807,8 +865,8 @@ function DenTab({ hasApiKey, jobActive }: { hasApiKey: boolean; jobActive: boole
                         <span className="inline-flex">
                           <Button
                             size="sm"
-                            className={jobActive ? "pointer-events-none" : undefined}
-                            disabled={jobActive}
+                            className={queueFull ? "pointer-events-none" : undefined}
+                            disabled={queueFull}
                             onClick={() =>
                               void rpc
                                 .call("evolveArt", { petId: pet.id })
@@ -823,9 +881,9 @@ function DenTab({ hasApiKey, jobActive }: { hasApiKey: boolean; jobActive: boole
                         </span>
                       </TooltipTrigger>
                       <TooltipContent>
-                        {jobActive
-                          ? "A generation job is already running"
-                          : `Regenerate the artwork to match its ${pet.stage.name} stage (~$2, a few minutes)`}
+                        {queueFull
+                          ? "Queue full — wait for a running job to finish"
+                          : `Regenerate the artwork to match its ${pet.stage.name} stage (~$1–3 depending on pack, a few minutes)`}
                       </TooltipContent>
                     </Tooltip>
                   ) : null}
@@ -864,12 +922,14 @@ function HatcheryTab({
   engine,
   pack,
   jobActive,
+  queueFull,
 }: {
   hasApiKey: boolean;
   hasRdKey: boolean;
   engine: string;
   pack: string;
   jobActive: boolean;
+  queueFull: boolean;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -949,7 +1009,7 @@ function HatcheryTab({
     }
   });
 
-  const busy = jobActive || phase === "drafting" || phase === "hatching";
+  const busy = queueFull || phase === "drafting" || phase === "hatching";
 
   /** Redraw the picked draft in place with a plain-language tweak — same id,
    *  same slot, new art. The v-bump is optimistic; the "draft-changed" signal
@@ -1027,9 +1087,10 @@ function HatcheryTab({
             ))}
           </div>
           <div className="flex flex-wrap items-center gap-3">
+            {/* A running job no longer blocks a new batch — it queues behind it. */}
             <Button
               size="sm"
-              disabled={busy || !hasApiKey || description.trim().length < 3}
+              disabled={queueFull || !hasApiKey || description.trim().length < 3}
               onClick={() => {
                 setPhase("drafting");
                 setStarting(true);
@@ -1054,7 +1115,9 @@ function HatcheryTab({
             >
               🎲 Surprise me
             </Button>
-            <span className="text-xs text-muted-foreground">4 candidates, ~30s</span>
+            <span className="text-xs text-muted-foreground">
+              4 candidates, ~30s · ~$0.25 per batch
+            </span>
           </div>
           {starting && !jobActive ? <StartingRow /> : null}
         </CardContent>
@@ -1276,9 +1339,22 @@ function DevCard() {
       <CardContent className="space-y-3 p-4">
         <div className="flex items-center justify-between gap-3">
           <p className="text-sm font-medium">Developer</p>
-          <Button size="sm" variant="ghost" className="text-xs" onClick={copyLog}>
-            Copy log
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button size="sm" variant="ghost" className="text-xs" onClick={copyLog}>
+              Copy log
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="text-xs"
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent("pets:preview-ceremony"));
+                toast.success("Ceremony playing on the overlay.");
+              }}
+            >
+              Preview ceremony
+            </Button>
+          </div>
         </div>
         <p className="font-mono text-xs">
           {state
@@ -1697,6 +1773,8 @@ export function PetsPanel({ subPath }: PluginNavPanelProps) {
   const [job, setJob] = useState<Job>(null);
   const [lastError, setLastError] = useState<JobError>(null);
   const [errorDismissedAt, setErrorDismissedAt] = useState(0);
+  const [skipped, setSkipped] = useState<SkippedCapture | null>(null);
+  const [queued, setQueued] = useState<QueuedJob[]>([]);
   const tab = subPath.split("/")[0] || "habitat";
 
   useEffect(() => {
@@ -1715,6 +1793,7 @@ export function PetsPanel({ subPath }: PluginNavPanelProps) {
       .then((r) => {
         setJob(r.job);
         setLastError(r.lastError);
+        setQueued(r.queued);
       })
       .catch(() => {});
   }, [rpc]);
@@ -1726,21 +1805,32 @@ export function PetsPanel({ subPath }: PluginNavPanelProps) {
       phase?: string;
       subject?: string;
       message?: string;
+      petId?: string;
       skipped?: { state: string; reason: string }[];
+      queued?: QueuedJob[];
     } | null;
-    if (signal?.kind === "job") setJob(signal.job ?? null);
-    else if (signal?.kind === "gen-error")
+    if (signal?.kind === "job") {
+      setJob(signal.job ?? null);
+      setQueued(signal.queued ?? []);
+    } else if (signal?.kind === "gen-error")
       setLastError({
         phase: signal.phase ?? "",
         subject: signal.subject ?? "",
         message: signal.message ?? "Generation failed.",
         at: Date.now(),
       });
-    else if (signal?.kind === "gen-warning" && Array.isArray(signal.skipped))
-      toast.warning(
-        `Skipped ${signal.skipped.map((s) => s.state).join(", ")} — fallbacks cover them; Re-animate to retry.`,
-      );
-    else if (signal?.kind === "settings-changed") {
+    else if (signal?.kind === "gen-warning" && Array.isArray(signal.skipped)) {
+      const states = signal.skipped.map((s) => s.state);
+      // The warning names its own pet; a null petId (a job with no pet yet)
+      // simply means no retry can be offered.
+      setSkipped({
+        petId: signal.petId ?? null,
+        states,
+        subject: signal.subject ?? "your pet",
+        at: Date.now(),
+      });
+      toast.warning(`Skipped ${states.join(", ")} — fallbacks cover them; retry from the banner.`);
+    } else if (signal?.kind === "settings-changed") {
       rpc
         .call("getOverlay")
         .then((r) => {
@@ -1754,6 +1844,20 @@ export function PetsPanel({ subPath }: PluginNavPanelProps) {
     }
   });
 
+  const retrySkipped = useCallback(() => {
+    if (!skipped?.petId) return;
+    const { petId, states } = skipped;
+    void rpc
+      .call("regenerateStates", { petId, states })
+      .then(() => {
+        toast.success(
+          `Retrying ${states.length} animation${states.length === 1 ? "" : "s"} for ${skipped.subject}…`,
+        );
+        setSkipped(null);
+      })
+      .catch((error: Error) => toast.error(error.message));
+  }, [rpc, skipped]);
+
   const toggleBehavior = useCallback(
     (key: BehaviorKey, value: boolean) => {
       setSettings((prev) => (prev ? { ...prev, [key]: value } : prev));
@@ -1762,14 +1866,20 @@ export function PetsPanel({ subPath }: PluginNavPanelProps) {
     [rpc],
   );
 
+  const queueFull = (job ? 1 : 0) + queued.length >= MAX_JOBS;
+
   return (
     <TooltipProvider delayDuration={300}>
       <div className="h-full overflow-y-auto p-4 md:p-5">
         <div className="mx-auto w-full max-w-3xl space-y-4">
           <JobBanner
             job={job}
+            queued={queued}
             lastError={lastError && lastError.at > errorDismissedAt ? lastError : null}
             onDismissError={() => setErrorDismissedAt(Date.now())}
+            skipped={skipped}
+            onRetrySkipped={retrySkipped}
+            onDismissSkipped={() => setSkipped(null)}
           />
           <Tabs
             value={tab}
@@ -1794,7 +1904,7 @@ export function PetsPanel({ subPath }: PluginNavPanelProps) {
               </div>
             </TabsContent>
             <TabsContent value="den" className="mt-4">
-              <DenTab hasApiKey={hasApiKey} jobActive={job !== null} />
+              <DenTab hasApiKey={hasApiKey} queueFull={queueFull} />
             </TabsContent>
             <TabsContent value="hatchery" className="mt-4">
               <HatcheryTab
@@ -1803,6 +1913,7 @@ export function PetsPanel({ subPath }: PluginNavPanelProps) {
                 engine={engine}
                 pack={pack}
                 jobActive={job !== null}
+                queueFull={queueFull}
               />
             </TabsContent>
             <TabsContent value="stats" className="mt-4">

@@ -1011,7 +1011,7 @@ var stepsOrder = [
 // node_modules/motion-dom/dist/es/frameloop/render-step.mjs
 function createRenderStep(runNextFrame) {
   let thisFrame = /* @__PURE__ */ new Set();
-  let nextFrame = /* @__PURE__ */ new Set();
+  let nextFrame2 = /* @__PURE__ */ new Set();
   let isProcessing = false;
   let flushNextFrame = false;
   const toKeepAlive = /* @__PURE__ */ new WeakSet();
@@ -1033,7 +1033,7 @@ function createRenderStep(runNextFrame) {
      */
     schedule: (callback, keepAlive = false, immediate = false) => {
       const addToCurrentFrame = immediate && isProcessing;
-      const queue = addToCurrentFrame ? thisFrame : nextFrame;
+      const queue = addToCurrentFrame ? thisFrame : nextFrame2;
       if (keepAlive)
         toKeepAlive.add(callback);
       queue.add(callback);
@@ -1043,7 +1043,7 @@ function createRenderStep(runNextFrame) {
      * Cancel the provided callback from running on the next frame.
      */
     cancel: (callback) => {
-      nextFrame.delete(callback);
+      nextFrame2.delete(callback);
       toKeepAlive.delete(callback);
     },
     /**
@@ -1057,8 +1057,8 @@ function createRenderStep(runNextFrame) {
       }
       isProcessing = true;
       const prevFrame = thisFrame;
-      thisFrame = nextFrame;
-      nextFrame = prevFrame;
+      thisFrame = nextFrame2;
+      nextFrame2 = prevFrame;
       thisFrame.forEach(triggerCallback);
       thisFrame.clear();
       isProcessing = false;
@@ -14309,6 +14309,49 @@ function resolveState(states, desired) {
   return first ?? "idle";
 }
 
+// overlay/core.ts
+var PLAY_MODES = {
+  sleep: { mode: "tailLoop", tailFraction: 0.5 },
+  sit: { mode: "holdLast" }
+};
+function nextFrame(raw, spec, renderedState) {
+  const pm = PLAY_MODES[renderedState];
+  if (!pm || raw < spec.frames) {
+    return pm && raw < spec.frames ? raw : spec.loop ? raw % spec.frames : Math.min(raw, spec.frames - 1);
+  }
+  if (pm.mode === "holdLast") return spec.frames - 1;
+  const tailLen = Math.max(1, Math.round(spec.frames * pm.tailFraction));
+  const tailStart = spec.frames - tailLen;
+  return tailStart + (raw - spec.frames) % tailLen;
+}
+var EMOTION_LABELS = {
+  idle: "\u{1F60C} content",
+  walk: "\u{1F6B6} wandering",
+  run: "\u{1F3C3} hustling",
+  think: "\u{1F914} thinking",
+  waiting: "\u23F3 waiting on you",
+  celebrate: "\u{1F389} celebrating",
+  sad: "\u{1F61E} down",
+  grumpy: "\u{1F63E} grumpy",
+  sleep: "\u{1F4A4} asleep",
+  wave: "\u{1F44B} hello",
+  point: "\u{1F449} look",
+  love: "\u2764\uFE0F loved",
+  dig: "\u26CF\uFE0F working",
+  jump: "\u2B06\uFE0F boing",
+  startled: "\u{1F633} startled",
+  sit: "\u{1FA91} perched",
+  stretch: "\u{1F646} stretching",
+  dance: "\u{1F57A} dancing"
+};
+function charGeometry(atlas, spec, srcCellW, charTarget) {
+  const idleSpec = atlas.states[resolveState(atlas.states, "idle")] ?? spec;
+  const refContentH = Math.max(1, idleSpec.contentHeight ?? idleSpec.height);
+  const pixelScale = charTarget / refContentH;
+  return { width: srcCellW * pixelScale, height: spec.height * pixelScale };
+}
+var randomBetween = (min, max) => min + Math.random() * (max - min);
+
 // overlay/net.ts
 async function rpc(pluginId, method, input) {
   const response = await fetch(`/api/v1/plugins/${pluginId}/rpc/${method}`, {
@@ -14587,8 +14630,11 @@ function voiceType(type) {
   return type;
 }
 var volumeFactor = 1;
+var footstepTrim = 1;
 function setSoundVolume(level) {
-  volumeFactor = level === "quiet" ? 0.45 : 1;
+  const quiet = level === "quiet";
+  volumeFactor = quiet ? 0.45 : 1;
+  footstepTrim = quiet ? 0.6 : 1;
 }
 function setSoundsEnabled(next) {
   enabled = next;
@@ -14607,7 +14653,7 @@ function unlockSounds() {
     context = null;
   }
 }
-function tone(frequency, start, duration, type = "square", peak = 0.5) {
+function tone(frequency, start, duration, type = "square", peak = 0.16) {
   if (!context || !master) return;
   const osc = context.createOscillator();
   const gain = context.createGain();
@@ -14640,36 +14686,44 @@ var play = (fn) => {
   fn();
 };
 var sounds = {
+  // interaction-grade (<= 0.16)
   greet: () => play(() => {
-    tone(523, 0, 0.09);
-    tone(784, 0.09, 0.14);
+    tone(523, 0, 0.09, "square", 0.16);
+    tone(784, 0.09, 0.14, "square", 0.16);
   }),
+  // interaction-grade (<= 0.16), second note kept below the first as before
   pet: () => play(() => {
-    tone(880, 0, 0.05, "sine", 0.4);
-    tone(1175, 0.05, 0.08, "sine", 0.3);
+    tone(880, 0, 0.05, "sine", 0.16);
+    tone(1175, 0.05, 0.08, "sine", 0.12);
   }),
+  // notification-grade (<= 0.22)
   alert: () => play(() => {
-    tone(660, 0, 0.07);
-    tone(660, 0.12, 0.07);
+    tone(660, 0, 0.07, "square", 0.22);
+    tone(660, 0.12, 0.07, "square", 0.22);
   }),
+  // ambient-grade (<= 0.12)
   womp: () => play(() => {
-    tone(196, 0, 0.16, "sawtooth", 0.25);
-    tone(147, 0.14, 0.22, "sawtooth", 0.25);
+    tone(196, 0, 0.16, "sawtooth", 0.12);
+    tone(147, 0.14, 0.22, "sawtooth", 0.12);
   }),
+  // notification-grade (<= 0.22), tail note kept under the arpeggio as before
   evolve: () => play(() => {
-    [523, 659, 784, 1047].forEach((f2, i2) => tone(f2, i2 * 0.09, 0.12));
-    tone(1319, 0.36, 0.3, "triangle", 0.4);
+    [523, 659, 784, 1047].forEach((f2, i2) => tone(f2, i2 * 0.09, 0.12, "square", 0.22));
+    tone(1319, 0.36, 0.3, "triangle", 0.18);
   }),
+  // notification-grade (<= 0.22), tail note kept under the rise as before
   hatch: () => play(() => {
-    tone(392, 0, 0.08);
-    tone(523, 0.08, 0.08);
-    tone(659, 0.16, 0.18, "triangle", 0.45);
+    tone(392, 0, 0.08, "square", 0.22);
+    tone(523, 0.08, 0.08, "square", 0.22);
+    tone(659, 0.16, 0.18, "triangle", 0.2);
   }),
+  // interaction-grade (<= 0.16), low bounce kept under the attack as before
   boing: () => play(() => {
-    tone(340, 0, 0.05, "sine", 0.3);
-    tone(180, 0.04, 0.1, "sine", 0.25);
+    tone(340, 0, 0.05, "sine", 0.16);
+    tone(180, 0.04, 0.1, "sine", 0.13);
   }),
-  /** A footfall: a filtered tick, deliberately below conversation level. The
+  /** A footfall: footstep-grade (<= 0.05), the quietest tier, and trimmed a
+   *  further x0.6 at the "quiet" volume level. The
    *  band is pitch-INVARIANT — a step is a floor sound, not a voice, so the
    *  per-pet pitch offset would only make it read as a different surface. */
   step: () => play(() => {
@@ -14683,7 +14737,7 @@ var sounds = {
     const gain = context.createGain();
     const t0 = context.currentTime;
     const duration = 0.026;
-    gain.gain.setValueAtTime(0.05 * volumeFactor, t0);
+    gain.gain.setValueAtTime(0.05 * volumeFactor * footstepTrim, t0);
     gain.gain.exponentialRampToValueAtTime(5e-4, t0 + duration);
     source.connect(filter2).connect(gain).connect(master);
     source.start(t0);
@@ -14707,6 +14761,7 @@ var TOUR_AUTOSTART_MS = 2500;
 var SLEEP_AFTER_MS = 10 * 60 * 1e3;
 var MOMENT_MS = 2800;
 var BUBBLE_MS = 6500;
+var BUBBLE_EDGE_PAD = 8;
 var POINT_MS = 4500;
 var AUTO_POINT_COOLDOWN_MS = 3 * 60 * 1e3;
 var POINTED_MEMORY_MS = 10 * 6e4;
@@ -14738,26 +14793,6 @@ var CEREMONY_REDUCED_MS = 2600;
 var CEREMONY_SILHOUETTE_MS = 900;
 var CEREMONY_REVEAL_MS = 350;
 var CEREMONY_CHAR_TARGET = 160;
-var EMOTION_LABELS = {
-  idle: "\u{1F60C} content",
-  walk: "\u{1F6B6} wandering",
-  run: "\u{1F3C3} hustling",
-  think: "\u{1F914} thinking",
-  waiting: "\u23F3 waiting on you",
-  celebrate: "\u{1F389} celebrating",
-  sad: "\u{1F61E} down",
-  grumpy: "\u{1F63E} grumpy",
-  sleep: "\u{1F4A4} asleep",
-  wave: "\u{1F44B} hello",
-  point: "\u{1F449} look",
-  love: "\u2764\uFE0F loved",
-  dig: "\u26CF\uFE0F working",
-  jump: "\u2B06\uFE0F boing",
-  startled: "\u{1F633} startled",
-  sit: "\u{1FA91} perched",
-  stretch: "\u{1F646} stretching",
-  dance: "\u{1F57A} dancing"
-};
 var DEFAULT_PERSONA = {
   funny: true,
   chaotic: true,
@@ -14804,10 +14839,6 @@ function logDebug(kind, detail) {
 }
 var IDLE_FRAME_DIVISOR = 4;
 var IDLE_SKIP_STATES = /* @__PURE__ */ new Set(["idle", "sleep", "sit"]);
-var PLAY_MODES = {
-  sleep: { mode: "tailLoop", tailFraction: 0.5 },
-  sit: { mode: "holdLast" }
-};
 function djb2(input) {
   let hash = 5381;
   for (let i2 = 0; i2 < input.length; i2 += 1) hash = hash * 33 ^ input.charCodeAt(i2);
@@ -14846,7 +14877,6 @@ function readAmbient(payload) {
   };
 }
 var looseRpc = rpc;
-var randomBetween = (min, max) => min + Math.random() * (max - min);
 var threadRowFor = (threadId) => document.querySelector(`[data-sidebar-thread-id="${CSS.escape(threadId)}"]`);
 var composerRect = () => document.querySelector("textarea, [contenteditable='true']")?.getBoundingClientRect() ?? null;
 var composerRects = () => {
@@ -15159,6 +15189,7 @@ function Overlay({ pluginId }) {
   const [viewedThreadId, setViewedThreadId] = useState(currentThreadId());
   const [spriteState, setSpriteState] = useState("wave");
   const [bubble, setBubble] = useState(null);
+  const [bubbleFit, setBubbleFit] = useState(null);
   const [hearts, setHearts] = useState([]);
   const [sparkles, setSparkles] = useState([]);
   const [motes, setMotes] = useState([]);
@@ -15262,6 +15293,9 @@ function Overlay({ pluginId }) {
   const ledgeBoingRef = useRef(0);
   const bubbleVisibleRef = useRef(false);
   const mountedAtRef = useRef(Date.now());
+  const bundleStampRef = useRef(null);
+  const staleShownRef = useRef(false);
+  const bubbleElRef = useRef(null);
   const currentActRef = useRef(null);
   const fpsRef = useRef({ fps: 0, tickFps: 0 });
   const loopPausedRef = useRef(false);
@@ -15394,6 +15428,21 @@ function Overlay({ pluginId }) {
     history.pushState({}, "", path);
     window.dispatchEvent(new PopStateEvent("popstate"));
   }, []);
+  const checkBundleStamp = useCallback(
+    (stamp) => {
+      if (typeof stamp !== "string" || stamp.length === 0) return;
+      if (bundleStampRef.current === null) {
+        bundleStampRef.current = stamp;
+      } else if (stamp !== bundleStampRef.current && !staleShownRef.current) {
+        staleShownRef.current = true;
+        logDebug("stale", stamp.slice(0, 16));
+        showBubble("i got an update. reload the window (\u2318R) to meet the new me.", {
+          important: true
+        });
+      }
+    },
+    [showBubble]
+  );
   const refetch = useCallback(() => {
     return rpc(pluginId, "getOverlay").then((next) => {
       setData(next);
@@ -15410,9 +15459,10 @@ function Overlay({ pluginId }) {
           pos.yBottom = next.prefs.y;
         }
       }
+      checkBundleStamp(next.bundleStamp);
       return next;
     });
-  }, [pluginId]);
+  }, [pluginId, checkBundleStamp]);
   const refetchQuiet = useCallback(() => {
     void refetch().catch(() => {
     });
@@ -15816,6 +15866,12 @@ function Overlay({ pluginId }) {
               setFleet(signal.fleet);
               checkLongRunners(signal.fleet);
             }
+            checkBundleStamp(payload.bundleStamp);
+            break;
+          // A plugin reload restarts the server without closing this socket,
+          // so the boot announce is the only stamp that arrives on reload.
+          case "server-boot":
+            checkBundleStamp(payload.bundleStamp);
             break;
           case "job":
             jobActiveRef.current = !!payload.job;
@@ -15912,6 +15968,13 @@ function Overlay({ pluginId }) {
             }
             break;
           }
+          case "glowup-available":
+            if (signal.stageName && !bubbleVisibleRef.current) {
+              showBubble(`i can look like a proper ${signal.stageName} now. glow up is in my menu.`, {
+                important: false
+              });
+            }
+            break;
           case "treat-earned":
             if (typeof signal.balance === "number") setTreatBalance(signal.balance);
             if (!bubbleVisibleRef.current) showBubble("treat earned. i saw it first.");
@@ -15946,6 +16009,7 @@ function Overlay({ pluginId }) {
     burstConfetti,
     burstSparkles,
     celebrateTier,
+    checkBundleStamp,
     checkLongRunners,
     dropTreatAt,
     hop,
@@ -15954,6 +16018,21 @@ function Overlay({ pluginId }) {
     refetchQuiet,
     showBubble
   ]);
+  useEffect(() => {
+    const onPreview = () => {
+      const current = dataRef.current?.pet;
+      if (!current) return;
+      logDebug("ceremony", "preview");
+      setCeremony({
+        name: current.name,
+        stageName: current.stage.name,
+        epithet: current.stage.epithet,
+        key: Date.now()
+      });
+    };
+    window.addEventListener("pets:preview-ceremony", onPreview);
+    return () => window.removeEventListener("pets:preview-ceremony", onPreview);
+  }, []);
   const artKey = data?.pet ? `${data.pet.id}:${data.pet.artStage}` : null;
   useEffect(() => {
     atlasRef.current = data?.pet?.atlas ?? null;
@@ -16091,6 +16170,24 @@ function Overlay({ pluginId }) {
     if (!bubble) return;
     const timer = setTimeout(() => setBubble(null), Math.max(0, bubble.until - Date.now()));
     return () => clearTimeout(timer);
+  }, [bubble]);
+  useLayoutEffect(() => {
+    if (!bubble) {
+      setBubbleFit(null);
+      return;
+    }
+    const el = bubbleElRef.current;
+    if (!el) return;
+    const width = el.getBoundingClientRect().width;
+    const petX = posRef.current.x ?? 0;
+    const petWidth = widthRef.current;
+    const naturalLeft = bubble.side === "left" ? petX : petX + petWidth - width;
+    const minLeft = BUBBLE_EDGE_PAD;
+    const maxLeft = Math.max(minLeft, window.innerWidth - BUBBLE_EDGE_PAD - width);
+    const left = Math.min(Math.max(naturalLeft, minLeft), maxLeft);
+    const petCenter = petX + petWidth / 2;
+    const side = left === naturalLeft ? bubble.side : petCenter - left > width / 2 ? "right" : "left";
+    setBubbleFit({ side, left: left - petX });
   }, [bubble]);
   useEffect(() => {
     if (!highlight) return;
@@ -16292,16 +16389,7 @@ function Overlay({ pluginId }) {
           frameClockRef.current %= 1;
           const raw = rawFrameRef.current + 1;
           rawFrameRef.current = raw;
-          const pm = PLAY_MODES[nextState];
-          if (!pm || raw < spec.frames) {
-            frameRef.current = pm && raw < spec.frames ? raw : spec.loop ? raw % spec.frames : Math.min(raw, spec.frames - 1);
-          } else if (pm.mode === "holdLast") {
-            frameRef.current = spec.frames - 1;
-          } else {
-            const tailLen = Math.max(1, Math.round(spec.frames * pm.tailFraction));
-            const tailStart = spec.frames - tailLen;
-            frameRef.current = tailStart + (raw - spec.frames) % tailLen;
-          }
+          frameRef.current = nextFrame(raw, spec, nextState);
           if (nextState === "walk" || nextState === "run") {
             stepParityRef.current ^= 1;
             if (stepParityRef.current === 0 && !document.hidden && !nappingRef.current) {
@@ -16316,13 +16404,9 @@ function Overlay({ pluginId }) {
       const ready = !!img && img.complete && img.naturalWidth > 0;
       const srcCellW = ready ? Math.floor(img.naturalWidth / spec.frames) : spec.width / spec.frames;
       const srcH = ready ? img.naturalHeight : spec.height;
-      const idleSpec = atlas.states[resolveState(atlas.states, "idle")] ?? spec;
-      const refContentH = Math.max(1, idleSpec.contentHeight ?? idleSpec.height);
       const petScale = dataRef.current?.pet?.sizeScale ?? 1;
       const charTarget = BASE_CHAR_HEIGHT * petScale;
-      const pixelScale = charTarget / refContentH;
-      const height = spec.height * pixelScale;
-      const width = srcCellW * pixelScale;
+      const { width, height } = charGeometry(atlas, spec, srcCellW, charTarget);
       widthRef.current = width;
       heightRef.current = height;
       const speedFactor = WALK_SPEEDS[dataRef.current?.settings.walkSpeed ?? "normal"] ?? 1;
@@ -17029,6 +17113,37 @@ function Overlay({ pluginId }) {
       facingRef.current = center >= (posRef.current.x ?? 0) + width / 2 ? 1 : -1;
       momentRef.current = { state: "sit", until: Date.now() + 6e3 };
     };
+    const landmarks = () => {
+      const found = [
+        document.querySelector('[aria-label="Pets"]') ?? document.querySelector("[data-sidebar-footer]"),
+        Array.from(document.querySelectorAll("nav a, nav button, [role='navigation'] a")).find(
+          (el) => (el.textContent ?? "").trim() === "Pets"
+        ),
+        document.querySelector("[role='tablist']") ?? document.querySelector("[data-pane-header]")
+      ];
+      return found.filter((el) => {
+        if (!el) return false;
+        const node = el;
+        if (node.checkVisibility ? !node.checkVisibility() : false) return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+    };
+    const inspectChrome = async () => {
+      const targets = landmarks();
+      const target = targets[Math.floor(Math.random() * targets.length)];
+      if (!target) return;
+      const rect = target.getBoundingClientRect();
+      const { width, minX, maxX } = bounds();
+      const center = rect.left + rect.width / 2;
+      walkToClear(Math.min(Math.max(center - width / 2, minX), maxX));
+      if (!await arrival()) return;
+      facingRef.current = center >= (posRef.current.x ?? 0) + width / 2 ? 1 : -1;
+      const states = atlasRef.current?.states;
+      const pose = states ? resolveState(states, "point") : "wave";
+      momentRef.current = { state: pose, until: Date.now() + 1800 };
+      await sleep(1800);
+    };
     const danceBreak = async () => {
       momentRef.current = { state: "dance", until: Date.now() + 3e3 };
       burstSparkles();
@@ -17060,7 +17175,14 @@ function Overlay({ pluginId }) {
         enabled: (p2) => p2.cozy || p2.helpful,
         run: composerWatch
       },
-      { label: "dance-break", weight: 6, motion: true, enabled: (p2) => p2.funny, run: danceBreak }
+      { label: "dance-break", weight: 6, motion: true, enabled: (p2) => p2.funny, run: danceBreak },
+      {
+        label: "inspect-chrome",
+        weight: 6,
+        motion: true,
+        enabled: (p2) => p2.cozy || p2.funny,
+        run: inspectChrome
+      }
     ];
     const schedule = () => {
       if (cancelled) return;
@@ -17302,8 +17424,10 @@ function Overlay({ pluginId }) {
               animate: { opacity: 1, y: 0, scale: 1 },
               exit: { opacity: 0, y: 4, scale: 0.98 },
               transition: { type: "spring", stiffness: 480, damping: 26 },
+              ref: bubbleElRef,
               "aria-hidden": "true",
-              className: `pets-bubble pets-bubble-${bubble.side} border border-border bg-card text-card-foreground shadow-md`,
+              className: `pets-bubble pets-bubble-${bubbleFit?.side ?? bubble.side} border border-border bg-card text-card-foreground shadow-md`,
+              style: bubbleFit ? { left: bubbleFit.left, right: "auto" } : void 0,
               onClick: () => {
                 if (bubble.threadId && bubble.projectId) {
                   navigateToThread(bubble.projectId, bubble.threadId);
@@ -17314,11 +17438,15 @@ function Overlay({ pluginId }) {
             },
             bubble.until
           ) : null }),
-          (data.settings.showEmotions ?? false) && !bubble ? /* @__PURE__ */ jsx(AnimatePresence, { mode: "wait", children: /* @__PURE__ */ jsx(
+          data.settings.showEmotions ?? false ? /* @__PURE__ */ jsx(AnimatePresence, { mode: "wait", children: /* @__PURE__ */ jsx(
             motion2.div,
             {
               className: `pointer-events-none absolute rounded-full border bg-card px-2 py-0.5 text-[10px] ${highContrast ? "border-foreground/40 text-foreground" : "border-border text-muted-foreground"}`,
-              style: { bottom: "calc(100% + 6px)", left: 0, width: "max-content" },
+              style: {
+                bottom: "calc(100% + 6px)",
+                ...bubble ? (bubbleFit?.side ?? bubble.side) === "left" ? { right: "calc(100% + 6px)", left: "auto" } : { left: "calc(100% + 6px)", right: "auto" } : { left: 0 },
+                width: "max-content"
+              },
               initial: { opacity: 0, y: 4 },
               animate: { opacity: 1, y: 0 },
               exit: { opacity: 0, y: -4 },
@@ -17790,30 +17918,25 @@ var SUSTAIN_REMIND_MS2 = 2500;
 var WALK_SPEEDS2 = { chill: 0.6, normal: 1, zoomies: 1.8 };
 var WALK_TO_SPEED2 = 90;
 var WALK_TO_ARRIVED_PX = 6;
-var PLAY_MODES2 = {
-  sleep: { mode: "tailLoop", tailFraction: 0.5 },
-  sit: { mode: "holdLast" }
-};
-var EMOTION_LABELS2 = {
-  idle: "\u{1F60C} content",
-  walk: "\u{1F6B6} wandering",
-  run: "\u{1F3C3} hustling",
-  think: "\u{1F914} thinking",
-  waiting: "\u23F3 waiting on you",
-  celebrate: "\u{1F389} celebrating",
-  sad: "\u{1F61E} down",
-  grumpy: "\u{1F63E} grumpy",
-  sleep: "\u{1F4A4} asleep",
-  wave: "\u{1F44B} hello",
-  point: "\u{1F449} look",
-  love: "\u2764\uFE0F loved",
-  dig: "\u26CF\uFE0F working",
-  jump: "\u2B06\uFE0F boing",
-  startled: "\u{1F633} startled",
-  sit: "\u{1FA91} perched",
-  stretch: "\u{1F646} stretching",
-  dance: "\u{1F57A} dancing"
-};
+var FLOOR_INSET = 12;
+var TREAT_MAX2 = 2;
+var TREAT_SIZE2 = 16;
+var TREAT_GRAVITY2 = GRAVITY2 * 0.6;
+var TREAT_BOUNCE2 = -0.3;
+var TREAT_MIN_X = 16;
+var TREAT_MAX_INSET = 24;
+var TREAT_REACH_PX2 = 14;
+var BALL_SIZE2 = 8;
+var BALL_THROW_VY2 = 320;
+var BALL_THROW_VX_MIN = 0.9;
+var BALL_THROW_VX_SPAN = 0.5;
+var BALL_FRICTION2 = 0.92;
+var BALL_STOP_VX2 = 12;
+var BALL_CATCH_PX2 = 14;
+var BALL_CHASE_MS2 = 200;
+var BALL_FADE_MS2 = 1200;
+var FETCH_BOOST2 = 1.6;
+var FETCH_TIMEOUT_MS2 = 2e4;
 var HABITAT_LINES = [
   "small stage. big presence.",
   "i live in a sidebar and i've made peace with it.",
@@ -17846,6 +17969,8 @@ function Habitat() {
   const [shownState, setShownState] = useState("idle");
   const [motes, setMotes] = useState([]);
   const [bubble, setBubble] = useState(null);
+  const [treatViews, setTreatViews] = useState([]);
+  const [ballView, setBallView] = useState(null);
   const stageRef = useRef(null);
   const anchorRef = useRef(null);
   const bodyRef = useRef(null);
@@ -17878,6 +18003,17 @@ function Habitat() {
   const clickTimerRef = useRef(null);
   const sizeSaveRef = useRef(null);
   const widthRef = useRef(HABITAT_CHAR_HEIGHT);
+  const heightRef = useRef(HABITAT_CHAR_HEIGHT);
+  const treatsRef = useRef([]);
+  const treatElsRef = useRef(/* @__PURE__ */ new Map());
+  const snackTargetRef = useRef(null);
+  const ballRef = useRef(null);
+  const ballElRef = useRef(null);
+  const fetchActiveRef = useRef(false);
+  const nextChaseRef = useRef(0);
+  const playTimersRef = useRef(/* @__PURE__ */ new Set());
+  const rpcRef = useRef(rpc2);
+  rpcRef.current = rpc2;
   const paintedRef = useRef({ state: null, frame: -1, facing: 0, tilt: 0, x: null, y: -1, scale: 0 });
   petRef.current = pet;
   fleetRef.current = fleet;
@@ -17907,6 +18043,55 @@ function Habitat() {
     });
   }, [rpc2]);
   useEffect(load, [load]);
+  const playTimeout = useCallback((fn, ms) => {
+    const id3 = setTimeout(() => {
+      playTimersRef.current.delete(id3);
+      fn();
+    }, ms);
+    playTimersRef.current.add(id3);
+  }, []);
+  const syncTreats = useCallback(() => {
+    setTreatViews(treatsRef.current.map((t2) => ({ id: t2.id, x: t2.x, yBottom: t2.yBottom })));
+  }, []);
+  const dropTreatAt = useCallback(
+    (fraction) => {
+      const stage = stageRef.current;
+      if (!stage) return;
+      const stageWidth = stage.clientWidth;
+      const maxX = Math.max(TREAT_MIN_X, stageWidth - TREAT_MAX_INSET);
+      const x3 = Math.min(Math.max(fraction * stageWidth, TREAT_MIN_X), maxX);
+      const treat = {
+        id: particleSeq2++,
+        x: x3,
+        // Straight in off the top edge of the stage, in floor-line coordinates.
+        yBottom: Math.max(0, stage.clientHeight - FLOOR_INSET),
+        vy: 0,
+        landed: false,
+        bounced: false
+      };
+      const next = [...treatsRef.current, treat].slice(-TREAT_MAX2);
+      treatsRef.current = next;
+      for (const id3 of [...treatElsRef.current.keys()]) {
+        if (!next.some((t2) => t2.id === id3)) treatElsRef.current.delete(id3);
+      }
+      if (snackTargetRef.current !== null && !next.some((t2) => t2.id === snackTargetRef.current)) {
+        snackTargetRef.current = null;
+      }
+      syncTreats();
+    },
+    [syncTreats]
+  );
+  const cancelFetch = useCallback(() => {
+    const had = !!ballRef.current;
+    ballRef.current = null;
+    ballElRef.current = null;
+    fetchActiveRef.current = false;
+    nextChaseRef.current = 0;
+    if (had) {
+      walkTargetRef.current = null;
+      setBallView(null);
+    }
+  }, []);
   useRealtime("pets", (payload) => {
     const signal = payload;
     switch (signal?.kind) {
@@ -17950,6 +18135,12 @@ function Habitat() {
         }
         break;
       }
+      // The same signal the overlay eats — one channel, both surfaces. The
+      // habitat just scales the landing fraction to the stage instead of the
+      // window.
+      case "treat-drop":
+        dropTreatAt(typeof signal.x === "number" ? signal.x : Math.random());
+        break;
       case "pet-changed":
       case "evolved-art":
       case "hatched":
@@ -17994,6 +18185,36 @@ function Habitat() {
     void rpc2.call("petPet", { petId: current.id }).catch(() => {
     });
   }, [burstHearts, rpc2]);
+  const startFetch = useCallback(() => {
+    const stage = stageRef.current;
+    if (!stage || isReducedMotion() || ballRef.current) return;
+    if (nappingRef.current) setNapping(false);
+    const pos = posRef.current;
+    const width = widthRef.current;
+    const originX = pos.x ?? 0;
+    const center = originX + width / 2;
+    const stageWidth = stage.clientWidth;
+    const direction = center < stageWidth / 2 ? 1 : -1;
+    ballRef.current = {
+      x: center - BALL_SIZE2 / 2,
+      yBottom: pos.yBottom + heightRef.current * 0.55,
+      vx: direction * stageWidth * (BALL_THROW_VX_MIN + Math.random() * BALL_THROW_VX_SPAN),
+      vy: BALL_THROW_VY2,
+      phase: "flying",
+      originX,
+      bounced: false,
+      startedAt: Date.now()
+    };
+    fetchActiveRef.current = true;
+    nextChaseRef.current = 0;
+    setBallView({
+      key: Date.now(),
+      x: ballRef.current.x,
+      yBottom: ballRef.current.yBottom,
+      fading: false
+    });
+    sounds.boing();
+  }, [isReducedMotion]);
   const goToNeediest = useCallback(() => {
     void rpc2.call("getNeediestThread").then(({ thread }) => {
       if (thread) navigate.toThread(thread.id);
@@ -18092,30 +18313,18 @@ function Habitat() {
           frameClockRef.current %= 1;
           const raw = rawFrameRef.current + 1;
           rawFrameRef.current = raw;
-          const pm = PLAY_MODES2[nextState];
-          if (!pm || raw < spec.frames) {
-            frameRef.current = pm && raw < spec.frames ? raw : spec.loop ? raw % spec.frames : Math.min(raw, spec.frames - 1);
-          } else if (pm.mode === "holdLast") {
-            frameRef.current = spec.frames - 1;
-          } else {
-            const tailLen = Math.max(1, Math.round(spec.frames * pm.tailFraction));
-            const tailStart = spec.frames - tailLen;
-            frameRef.current = tailStart + (raw - spec.frames) % tailLen;
-          }
+          frameRef.current = nextFrame(raw, spec, nextState);
         }
       }
       const img = imagesRef.current.get(nextState);
       const ready = !!img && img.complete && img.naturalWidth > 0;
       const srcCellW = ready ? Math.floor(img.naturalWidth / spec.frames) : spec.width / spec.frames;
       const srcH = ready ? img.naturalHeight : spec.height;
-      const idleSpec = atlas.states[resolveState(atlas.states, "idle")] ?? spec;
-      const refContentH = Math.max(1, idleSpec.contentHeight ?? idleSpec.height);
       const petScale = petRef.current?.sizeScale ?? 1;
       const charTarget = HABITAT_CHAR_HEIGHT * petScale;
-      const pixelScale = charTarget / refContentH;
-      const height = spec.height * pixelScale;
-      const width = srcCellW * pixelScale;
+      const { width, height } = charGeometry(atlas, spec, srcCellW, charTarget);
       widthRef.current = width;
+      heightRef.current = height;
       const pos = posRef.current;
       const vel = velRef.current;
       const minX = EDGE_MARGIN2;
@@ -18152,6 +18361,146 @@ function Habitat() {
       }
       pos.x = Math.min(Math.max(pos.x, minX), maxX);
       pos.yBottom = Math.min(pos.yBottom, Math.max(0, stageHeight - 100));
+      const playNow = Date.now();
+      const treats = treatsRef.current;
+      for (const treat of treats) {
+        if (treat.landed) continue;
+        treat.vy -= TREAT_GRAVITY2 * dt;
+        treat.yBottom += treat.vy * dt;
+        if (treat.yBottom <= 0) {
+          treat.yBottom = 0;
+          if (!reducedMotion && !treat.bounced && Math.abs(treat.vy) > 120) {
+            treat.bounced = true;
+            treat.vy *= TREAT_BOUNCE2;
+          } else {
+            treat.vy = 0;
+            treat.landed = true;
+          }
+        }
+      }
+      const playMoment = momentRef.current;
+      const petFree = !airborneRef.current && !nappingRef.current && !dragRef.current && !(playMoment && playNow < playMoment.until);
+      if (treats.length > 0 && !ballRef.current) {
+        let target = null;
+        if (snackTargetRef.current !== null) {
+          target = treats.find((t2) => t2.id === snackTargetRef.current) ?? null;
+          if (!target) snackTargetRef.current = null;
+        }
+        if (!target && petFree && walkTargetRef.current === null) {
+          const center = pos.x + width / 2;
+          let bestDistance = Number.POSITIVE_INFINITY;
+          for (const treat of treats) {
+            if (!treat.landed) continue;
+            const distance2 = Math.abs(treat.x + TREAT_SIZE2 / 2 - center);
+            if (distance2 < bestDistance) {
+              bestDistance = distance2;
+              target = treat;
+            }
+          }
+          if (target) snackTargetRef.current = target.id;
+        }
+        if (target && target.landed && petFree) {
+          const treatCenter = target.x + TREAT_SIZE2 / 2;
+          if (Math.abs(pos.x + width / 2 - treatCenter) < TREAT_REACH_PX2) {
+            const eaten = target;
+            treatsRef.current = treats.filter((t2) => t2.id !== eaten.id);
+            treatElsRef.current.delete(eaten.id);
+            snackTargetRef.current = null;
+            walkTargetRef.current = null;
+            momentRef.current = { state: "love", until: playNow + 1200 };
+            burstHearts();
+            pulseClass("pets-land", 200);
+            sounds.pet();
+            void rpcRef.current.call("eatTreat").catch(() => {
+            });
+            syncTreats();
+          } else {
+            facingRef.current = treatCenter >= pos.x + width / 2 ? 1 : -1;
+            walkTargetRef.current = Math.min(Math.max(treatCenter - width / 2, minX), maxX);
+          }
+        }
+      }
+      for (const treat of treatsRef.current) {
+        const node = treatElsRef.current.get(treat.id);
+        if (node) node.style.transform = `translate(${treat.x}px, ${-treat.yBottom}px)`;
+      }
+      const ball = ballRef.current;
+      if (ball) {
+        const ballMinX = EDGE_MARGIN2;
+        const ballMaxX = Math.max(ballMinX, stage.clientWidth - EDGE_MARGIN2 - BALL_SIZE2);
+        if (ball.phase === "flying") {
+          ball.vy -= GRAVITY2 * dt;
+          ball.x += ball.vx * dt;
+          ball.yBottom += ball.vy * dt;
+          if (ball.x <= ballMinX || ball.x >= ballMaxX) {
+            ball.x = Math.min(Math.max(ball.x, ballMinX), ballMaxX);
+            ball.vx = -ball.vx * WALL_BOUNCE2;
+          }
+          if (ball.yBottom <= 0) {
+            ball.yBottom = 0;
+            if (!ball.bounced && Math.abs(ball.vy) > SETTLE_VY2) {
+              ball.bounced = true;
+              ball.vy = -ball.vy * FLOOR_BOUNCE2;
+              ball.vx *= 0.8;
+            } else {
+              ball.vy = 0;
+              ball.phase = "rolling";
+            }
+          }
+        } else if (ball.phase === "rolling") {
+          ball.x += ball.vx * dt;
+          ball.vx *= Math.pow(BALL_FRICTION2, dt * 60);
+          if (Math.abs(ball.vx) < BALL_STOP_VX2) ball.vx = 0;
+          if (ball.x <= ballMinX || ball.x >= ballMaxX) {
+            ball.x = Math.min(Math.max(ball.x, ballMinX), ballMaxX);
+            ball.vx = -ball.vx * WALL_BOUNCE2;
+          }
+          ball.yBottom = 0;
+        } else if (ball.phase === "carried") {
+          ball.x = pos.x + width / 2 - BALL_SIZE2 / 2;
+          ball.yBottom = pos.yBottom + height * 0.9;
+        }
+        if (ball.phase === "flying" || ball.phase === "rolling") {
+          if (playNow - ball.startedAt > FETCH_TIMEOUT_MS2) {
+            cancelFetch();
+          } else if (petFree) {
+            const ballCenter = ball.x + BALL_SIZE2 / 2;
+            if (playNow >= nextChaseRef.current) {
+              nextChaseRef.current = playNow + BALL_CHASE_MS2;
+              walkTargetRef.current = Math.min(Math.max(ballCenter - width / 2, minX), maxX);
+            }
+            const grounded = ball.phase === "rolling" || ball.yBottom <= 2;
+            if (grounded && Math.abs(pos.x + width / 2 - ballCenter) < BALL_CATCH_PX2) {
+              ball.phase = "carried";
+              ball.vx = 0;
+              ball.vy = 0;
+              nextChaseRef.current = 0;
+              sounds.pet();
+              walkTargetRef.current = Math.min(Math.max(ball.originX, minX), maxX);
+            }
+          }
+        } else if (ball.phase === "carried" && walkTargetRef.current === null && petFree) {
+          ball.phase = "done";
+          ball.x = pos.x + width / 2 - BALL_SIZE2 / 2;
+          ball.yBottom = 0;
+          fetchActiveRef.current = false;
+          momentRef.current = { state: "celebrate", until: playNow + 1400 };
+          sounds.pet();
+          void rpcRef.current.call("recordFetch").catch(() => {
+          });
+          const restX = ball.x;
+          const restY = ball.yBottom;
+          setBallView(
+            (prev) => prev ? { ...prev, x: restX, yBottom: restY, fading: true } : prev
+          );
+          playTimeout(() => {
+            if (ballRef.current?.phase === "done") ballRef.current = null;
+            setBallView(null);
+          }, BALL_FADE_MS2);
+        }
+        const ballNode = ballElRef.current;
+        if (ballNode) ballNode.style.transform = `translate(${ball.x}px, ${-ball.yBottom}px)`;
+      }
       const frozen = !!dragRef.current;
       const walkTarget = walkTargetRef.current;
       if (walkTarget !== null) {
@@ -18168,7 +18517,8 @@ function Habitat() {
           } else {
             const direction = delta > 0 ? 1 : -1;
             const speedFactor = WALK_SPEEDS2[settingsRef.current?.walkSpeed ?? "normal"] ?? 1;
-            const step = WALK_TO_SPEED2 * speedFactor * dt;
+            const boost = fetchActiveRef.current ? FETCH_BOOST2 : 1;
+            const step = WALK_TO_SPEED2 * speedFactor * boost * dt;
             pos.x = Math.abs(delta) <= step ? goal : pos.x + direction * step;
             facingRef.current = direction;
           }
@@ -18256,10 +18606,28 @@ function Habitat() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [pet, deriveState, isReducedMotion, pulseClass]);
+  }, [
+    pet,
+    deriveState,
+    isReducedMotion,
+    pulseClass,
+    burstHearts,
+    cancelFetch,
+    playTimeout,
+    syncTreats
+  ]);
   useEffect(() => {
+    const playTimers = playTimersRef.current;
     return () => {
       if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
+      for (const id3 of playTimers) clearTimeout(id3);
+      playTimers.clear();
+      treatsRef.current = [];
+      treatElsRef.current.clear();
+      snackTargetRef.current = null;
+      ballRef.current = null;
+      ballElRef.current = null;
+      fetchActiveRef.current = false;
     };
   }, []);
   useEffect(() => {
@@ -18352,7 +18720,7 @@ function Habitat() {
         const busy = document.hidden || !!dragRef.current || nappingRef.current || airborneRef.current || walkTargetRef.current !== null;
         if (!busy) act2();
         schedule();
-      }, min + Math.random() * (max - min));
+      }, randomBetween(min, max));
     };
     schedule();
     return () => {
@@ -18367,6 +18735,8 @@ function Habitat() {
     const pos = posRef.current;
     airborneRef.current = false;
     velRef.current = { vx: 0, vy: 0 };
+    cancelFetch();
+    snackTargetRef.current = null;
     dragRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -18522,6 +18892,64 @@ function Habitat() {
         onPointerDown: onStagePointerDown,
         children: [
           /* @__PURE__ */ jsx("div", { className: "absolute inset-x-0 bottom-3 border-t border-border/60" }),
+          treatViews.map((treat) => /* @__PURE__ */ jsx(
+            "span",
+            {
+              ref: (node) => {
+                if (node) treatElsRef.current.set(treat.id, node);
+                else treatElsRef.current.delete(treat.id);
+              },
+              role: "button",
+              tabIndex: 0,
+              "aria-label": "A treat",
+              title: "A treat",
+              className: "absolute left-0 select-none leading-none",
+              style: {
+                bottom: FLOOR_INSET,
+                fontSize: TREAT_SIZE2,
+                pointerEvents: "auto",
+                cursor: "pointer",
+                willChange: "transform",
+                transform: `translate(${treat.x}px, ${-treat.yBottom}px)`
+              },
+              onPointerDown: (event) => {
+                event.stopPropagation();
+                snackTargetRef.current = treat.id;
+              },
+              onKeyDown: (event) => {
+                if (event.key !== "Enter" && event.key !== " ") return;
+                event.preventDefault();
+                snackTargetRef.current = treat.id;
+              },
+              children: "\u{1F36A}"
+            },
+            treat.id
+          )),
+          ballView ? /* @__PURE__ */ jsx(
+            motion2.div,
+            {
+              ref: ballElRef,
+              "aria-hidden": "true",
+              className: "absolute left-0",
+              style: {
+                bottom: FLOOR_INSET,
+                boxSizing: "border-box",
+                width: BALL_SIZE2,
+                height: BALL_SIZE2,
+                borderRadius: 2,
+                background: "var(--primary, rgb(120 160 255))",
+                border: "2px solid rgb(0 0 0 / 0.45)",
+                imageRendering: "pixelated",
+                pointerEvents: "none",
+                willChange: "transform",
+                transform: `translate(${ballView.x}px, ${-ballView.yBottom}px)`
+              },
+              initial: { opacity: 1 },
+              animate: { opacity: ballView.fading ? 0 : 1 },
+              transition: { duration: ballView.fading ? BALL_FADE_MS2 / 1e3 : 0, ease: "linear" }
+            },
+            ballView.key
+          ) : null,
           /* @__PURE__ */ jsxs("div", { ref: anchorRef, className: "absolute left-0", style: { bottom: 12 }, children: [
             settingsRef.current?.showEmotions ? /* @__PURE__ */ jsx(AnimatePresence, { mode: "wait", children: /* @__PURE__ */ jsx(
               motion2.div,
@@ -18531,7 +18959,7 @@ function Habitat() {
                 initial: { opacity: 0, y: 3 },
                 animate: { opacity: 1, y: 0 },
                 exit: { opacity: 0 },
-                children: EMOTION_LABELS2[shownState] ?? shownState
+                children: EMOTION_LABELS[shownState] ?? shownState
               },
               shownState
             ) }) : null,
@@ -18585,6 +19013,18 @@ function Habitat() {
         pet.name
       ] }),
       /* @__PURE__ */ jsx(Button, { size: "sm", variant: "outline", onClick: toggleNap, children: napping ? "Wake up" : "Nap" }),
+      isReducedMotion() ? null : /* @__PURE__ */ jsx(
+        Button,
+        {
+          size: "icon",
+          variant: "ghost",
+          className: "h-8 w-8",
+          "aria-label": "Play fetch",
+          disabled: !!ballView,
+          onClick: startFetch,
+          children: "\u{1F3BE}"
+        }
+      ),
       /* @__PURE__ */ jsx(Button, { size: "sm", variant: "outline", onClick: goToNeediest, children: "What needs attention?" })
     ] })
   ] });
@@ -21685,6 +22125,7 @@ function EngineRecipe({
     !hasRdKey ? /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: "You can hatch without Retro Diffusion \u2014 animations fall back to gpt-image with pixel-perfect quantization. Get a key at retrodiffusion.ai (~$2 per pet)." }) : null
   ] }) });
 }
+var MAX_JOBS = 3;
 var PHASE_LABELS = {
   drafts: "Drafting candidates for",
   hatch: "Hatching",
@@ -21699,8 +22140,12 @@ function formatElapsed(since) {
 }
 function JobBanner({
   job,
+  queued,
   lastError,
-  onDismissError
+  onDismissError,
+  skipped,
+  onRetrySkipped,
+  onDismissSkipped
 }) {
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -21755,9 +22200,21 @@ function JobBanner({
           state
         );
       }) }) : null,
-      /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: slow ? `No progress for ${Math.floor(sinceProgress / 1e3)}s \u2014 image APIs crawl sometimes; still connected and working.` : "Runs on the server \u2014 you can leave this page and come back." })
+      /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: slow ? `No progress for ${Math.floor(sinceProgress / 1e3)}s \u2014 image APIs crawl sometimes; still connected and working.` : "Runs on the server \u2014 you can leave this page and come back." }),
+      queued.map((entry) => /* @__PURE__ */ jsxs("p", { className: "text-xs text-muted-foreground", children: [
+        "queued: ",
+        entry.subject,
+        " (",
+        entry.phase,
+        ")"
+      ] }, entry.jobId))
     ] }) });
   }
+  const retryButton = skipped && skipped.petId ? /* @__PURE__ */ jsxs(Button, { size: "sm", variant: "outline", onClick: onRetrySkipped, children: [
+    "Retry skipped (",
+    skipped.states.length,
+    ")"
+  ] }) : null;
   if (lastError) {
     return /* @__PURE__ */ jsxs(Alert, { className: "border-destructive/50", children: [
       /* @__PURE__ */ jsxs(AlertTitle, { children: [
@@ -21773,7 +22230,35 @@ function JobBanner({
       ] }),
       /* @__PURE__ */ jsxs(AlertDescription, { className: "flex items-center justify-between gap-3", children: [
         /* @__PURE__ */ jsx("span", { className: "min-w-0 flex-1", children: lastError.message }),
+        retryButton,
         /* @__PURE__ */ jsx(Button, { size: "sm", variant: "outline", onClick: onDismissError, children: "Dismiss" })
+      ] })
+    ] });
+  }
+  if (skipped) {
+    return /* @__PURE__ */ jsxs(Alert, { className: "border-amber-500/50", children: [
+      /* @__PURE__ */ jsxs(AlertTitle, { children: [
+        "Skipped ",
+        skipped.states.length,
+        " animation",
+        skipped.states.length === 1 ? "" : "s",
+        " for",
+        " ",
+        skipped.subject,
+        " ",
+        /* @__PURE__ */ jsxs("span", { className: "font-normal text-muted-foreground", children: [
+          "\xB7 ",
+          timeAgo(skipped.at)
+        ] })
+      ] }),
+      /* @__PURE__ */ jsxs(AlertDescription, { className: "flex items-center justify-between gap-3", children: [
+        /* @__PURE__ */ jsxs("span", { className: "min-w-0 flex-1", children: [
+          "Fallbacks cover ",
+          skipped.states.join(", "),
+          " \u2014 retry to draw them properly."
+        ] }),
+        retryButton,
+        /* @__PURE__ */ jsx(Button, { size: "sm", variant: "outline", onClick: onDismissSkipped, children: "Dismiss" })
       ] })
     ] });
   }
@@ -21924,7 +22409,7 @@ function LineageStrip({ petId }) {
     );
   }) });
 }
-function FixAnimationsPicker({ pet, jobActive }) {
+function FixAnimationsPicker({ pet, queueFull }) {
   const rpc2 = useRpc();
   const [open, setOpen] = useState(false);
   const [selection, setSelection] = useState(/* @__PURE__ */ new Set());
@@ -21953,12 +22438,12 @@ function FixAnimationsPicker({ pet, jobActive }) {
             {
               size: "sm",
               variant: "ghost",
-              className: `text-muted-foreground${jobActive ? " pointer-events-none" : ""}`,
-              disabled: jobActive,
+              className: `text-muted-foreground${queueFull ? " pointer-events-none" : ""}`,
+              disabled: queueFull,
               children: "Fix animations\u2026"
             }
           ) }) }) }),
-          /* @__PURE__ */ jsx(TooltipContent2, { children: jobActive ? "A generation job is already running" : "Regenerate only the animations you pick" })
+          /* @__PURE__ */ jsx(TooltipContent2, { children: queueFull ? "Queue full \u2014 wait for a running job to finish" : "Regenerate only the animations you pick" })
         ] }),
         /* @__PURE__ */ jsxs(PopoverContent2, { className: "w-64 space-y-2", mobileTitle: "Regenerate specific animations", children: [
           /* @__PURE__ */ jsx("p", { className: "text-sm font-medium", children: "Regenerate specific animations" }),
@@ -21995,7 +22480,7 @@ function FixAnimationsPicker({ pet, jobActive }) {
               }
             )
           ] }),
-          /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: "Only the selected animations are regenerated and merged \u2014 the rest keep their art." }),
+          /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: "Only the selected animations are regenerated and merged \u2014 the rest keep their art. ~$0.25 per state." }),
           /* @__PURE__ */ jsxs(
             Button,
             {
@@ -22020,7 +22505,7 @@ function FixAnimationsPicker({ pet, jobActive }) {
     }
   );
 }
-function DenTab({ hasApiKey, jobActive }) {
+function DenTab({ hasApiKey, queueFull }) {
   const rpc2 = useRpc();
   const navigate = useBbNavigate();
   const [pets, setPets] = useState(null);
@@ -22167,15 +22652,15 @@ function DenTab({ hasApiKey, jobActive }) {
                   {
                     size: "sm",
                     variant: "ghost",
-                    className: `text-muted-foreground${jobActive ? " pointer-events-none" : ""}`,
-                    disabled: jobActive,
+                    className: `text-muted-foreground${queueFull ? " pointer-events-none" : ""}`,
+                    disabled: queueFull,
                     onClick: () => void rpc2.call("refreshArt", { petId: pet.id }).then(() => toast.success(`Re-animating ${pet.name}\u2026`)).catch((error) => toast.error(error.message)),
                     children: "Re-animate"
                   }
                 ) }) }),
-                /* @__PURE__ */ jsx(TooltipContent2, { children: jobActive ? "A generation job is already running" : "Regenerate every animation through the latest engine at the current pack \u2014 upgrades older pets to new animation sets (~a few minutes)" })
+                /* @__PURE__ */ jsx(TooltipContent2, { children: queueFull ? "Queue full \u2014 wait for a running job to finish" : "Regenerate every animation through the latest engine at the current pack \u2014 upgrades older pets to new animation sets (~a few minutes, ~$1\u20133 depending on pack)" })
               ] }) : null,
-              hasApiKey ? /* @__PURE__ */ jsx(FixAnimationsPicker, { pet, jobActive }) : null,
+              hasApiKey ? /* @__PURE__ */ jsx(FixAnimationsPicker, { pet, queueFull }) : null,
               !pet.active ? /* @__PURE__ */ jsxs(AlertDialog2, { children: [
                 /* @__PURE__ */ jsx(AlertDialogTrigger2, { asChild: true, children: /* @__PURE__ */ jsx(Button, { size: "sm", variant: "ghost", className: "text-muted-foreground hover:text-destructive", children: "Release\u2026" }) }),
                 /* @__PURE__ */ jsxs(AlertDialogContent2, { children: [
@@ -22257,15 +22742,15 @@ function DenTab({ hasApiKey, jobActive }) {
                   Button,
                   {
                     size: "sm",
-                    className: jobActive ? "pointer-events-none" : void 0,
-                    disabled: jobActive,
+                    className: queueFull ? "pointer-events-none" : void 0,
+                    disabled: queueFull,
                     onClick: () => void rpc2.call("evolveArt", { petId: pet.id }).then(
                       () => toast.success(`Redrawing ${pet.name} as ${pet.stage.name}\u2026`)
                     ).catch((error) => toast.error(error.message)),
                     children: "\u2728 Glow up"
                   }
                 ) }) }),
-                /* @__PURE__ */ jsx(TooltipContent2, { children: jobActive ? "A generation job is already running" : `Regenerate the artwork to match its ${pet.stage.name} stage (~$2, a few minutes)` })
+                /* @__PURE__ */ jsx(TooltipContent2, { children: queueFull ? "Queue full \u2014 wait for a running job to finish" : `Regenerate the artwork to match its ${pet.stage.name} stage (~$1\u20133 depending on pack, a few minutes)` })
               ] }) : null
             ] })
           ] }) })
@@ -22294,7 +22779,8 @@ function HatcheryTab({
   hasRdKey,
   engine,
   pack,
-  jobActive
+  jobActive,
+  queueFull
 }) {
   const rpc2 = useRpc();
   const navigate = useBbNavigate();
@@ -22355,7 +22841,7 @@ function HatcheryTab({
         break;
     }
   });
-  const busy = jobActive || phase === "drafting" || phase === "hatching";
+  const busy = queueFull || phase === "drafting" || phase === "hatching";
   const refine = () => {
     const draftId = picked?.id;
     const text = instruction.trim();
@@ -22427,7 +22913,7 @@ function HatcheryTab({
           Button,
           {
             size: "sm",
-            disabled: busy || !hasApiKey || description.trim().length < 3,
+            disabled: queueFull || !hasApiKey || description.trim().length < 3,
             onClick: () => {
               setPhase("drafting");
               setStarting(true);
@@ -22450,7 +22936,7 @@ function HatcheryTab({
             children: "\u{1F3B2} Surprise me"
           }
         ),
-        /* @__PURE__ */ jsx("span", { className: "text-xs text-muted-foreground", children: "4 candidates, ~30s" })
+        /* @__PURE__ */ jsx("span", { className: "text-xs text-muted-foreground", children: "4 candidates, ~30s \xB7 ~$0.25 per batch" })
       ] }),
       starting && !jobActive ? /* @__PURE__ */ jsx(StartingRow, {}) : null
     ] }) }),
@@ -22652,7 +23138,22 @@ function DevCard() {
   return /* @__PURE__ */ jsx(Card, { children: /* @__PURE__ */ jsxs(CardContent, { className: "space-y-3 p-4", children: [
     /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between gap-3", children: [
       /* @__PURE__ */ jsx("p", { className: "text-sm font-medium", children: "Developer" }),
-      /* @__PURE__ */ jsx(Button, { size: "sm", variant: "ghost", className: "text-xs", onClick: copyLog, children: "Copy log" })
+      /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-1", children: [
+        /* @__PURE__ */ jsx(Button, { size: "sm", variant: "ghost", className: "text-xs", onClick: copyLog, children: "Copy log" }),
+        /* @__PURE__ */ jsx(
+          Button,
+          {
+            size: "sm",
+            variant: "ghost",
+            className: "text-xs",
+            onClick: () => {
+              window.dispatchEvent(new CustomEvent("pets:preview-ceremony"));
+              toast.success("Ceremony playing on the overlay.");
+            },
+            children: "Preview ceremony"
+          }
+        )
+      ] })
     ] }),
     /* @__PURE__ */ jsx("p", { className: "font-mono text-xs", children: state ? `${state.state} \xB7 elev ${Math.round(state.elev)}px \xB7 x ${Math.round(state.x)} \xB7 act ${state.act ?? "\u2014"} \xB7 ${Math.round(state.fps)} fps` : "waiting for overlay\u2026" }),
     /* @__PURE__ */ jsxs("div", { className: "max-h-48 space-y-0.5 overflow-y-auto", children: [
@@ -22957,6 +23458,8 @@ function PetsPanel({ subPath }) {
   const [job, setJob] = useState(null);
   const [lastError, setLastError] = useState(null);
   const [errorDismissedAt, setErrorDismissedAt] = useState(0);
+  const [skipped, setSkipped] = useState(null);
+  const [queued, setQueued] = useState([]);
   const tab = subPath.split("/")[0] || "habitat";
   useEffect(() => {
     rpc2.call("getOverlay").then((r4) => {
@@ -22970,24 +23473,32 @@ function PetsPanel({ subPath }) {
     rpc2.call("getJobStatus").then((r4) => {
       setJob(r4.job);
       setLastError(r4.lastError);
+      setQueued(r4.queued);
     }).catch(() => {
     });
   }, [rpc2]);
   useRealtime("pets", (payload) => {
     const signal = payload;
-    if (signal?.kind === "job") setJob(signal.job ?? null);
-    else if (signal?.kind === "gen-error")
+    if (signal?.kind === "job") {
+      setJob(signal.job ?? null);
+      setQueued(signal.queued ?? []);
+    } else if (signal?.kind === "gen-error")
       setLastError({
         phase: signal.phase ?? "",
         subject: signal.subject ?? "",
         message: signal.message ?? "Generation failed.",
         at: Date.now()
       });
-    else if (signal?.kind === "gen-warning" && Array.isArray(signal.skipped))
-      toast.warning(
-        `Skipped ${signal.skipped.map((s2) => s2.state).join(", ")} \u2014 fallbacks cover them; Re-animate to retry.`
-      );
-    else if (signal?.kind === "settings-changed") {
+    else if (signal?.kind === "gen-warning" && Array.isArray(signal.skipped)) {
+      const states = signal.skipped.map((s2) => s2.state);
+      setSkipped({
+        petId: signal.petId ?? null,
+        states,
+        subject: signal.subject ?? "your pet",
+        at: Date.now()
+      });
+      toast.warning(`Skipped ${states.join(", ")} \u2014 fallbacks cover them; retry from the banner.`);
+    } else if (signal?.kind === "settings-changed") {
       rpc2.call("getOverlay").then((r4) => {
         setHasApiKey(r4.hasApiKey);
         setHasRdKey(r4.hasRdKey);
@@ -22998,6 +23509,16 @@ function PetsPanel({ subPath }) {
       });
     }
   });
+  const retrySkipped = useCallback(() => {
+    if (!skipped?.petId) return;
+    const { petId, states } = skipped;
+    void rpc2.call("regenerateStates", { petId, states }).then(() => {
+      toast.success(
+        `Retrying ${states.length} animation${states.length === 1 ? "" : "s"} for ${skipped.subject}\u2026`
+      );
+      setSkipped(null);
+    }).catch((error) => toast.error(error.message));
+  }, [rpc2, skipped]);
   const toggleBehavior = useCallback(
     (key, value) => {
       setSettings((prev) => prev ? { ...prev, [key]: value } : prev);
@@ -23006,13 +23527,18 @@ function PetsPanel({ subPath }) {
     },
     [rpc2]
   );
+  const queueFull = (job ? 1 : 0) + queued.length >= MAX_JOBS;
   return /* @__PURE__ */ jsx(TooltipProvider2, { delayDuration: 300, children: /* @__PURE__ */ jsx("div", { className: "h-full overflow-y-auto p-4 md:p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto w-full max-w-3xl space-y-4", children: [
     /* @__PURE__ */ jsx(
       JobBanner,
       {
         job,
+        queued,
         lastError: lastError && lastError.at > errorDismissedAt ? lastError : null,
-        onDismissError: () => setErrorDismissedAt(Date.now())
+        onDismissError: () => setErrorDismissedAt(Date.now()),
+        skipped,
+        onRetrySkipped: retrySkipped,
+        onDismissSkipped: () => setSkipped(null)
       }
     ),
     /* @__PURE__ */ jsxs(
@@ -23033,7 +23559,7 @@ function PetsPanel({ subPath }) {
             /* @__PURE__ */ jsx(BehaviorsCard, { settings, onToggle: toggleBehavior }),
             /* @__PURE__ */ jsx(PersonalityCard, { settings, onToggle: toggleBehavior })
           ] }) }),
-          /* @__PURE__ */ jsx(TabsContent3, { value: "den", className: "mt-4", children: /* @__PURE__ */ jsx(DenTab, { hasApiKey, jobActive: job !== null }) }),
+          /* @__PURE__ */ jsx(TabsContent3, { value: "den", className: "mt-4", children: /* @__PURE__ */ jsx(DenTab, { hasApiKey, queueFull }) }),
           /* @__PURE__ */ jsx(TabsContent3, { value: "hatchery", className: "mt-4", children: /* @__PURE__ */ jsx(
             HatcheryTab,
             {
@@ -23041,7 +23567,8 @@ function PetsPanel({ subPath }) {
               hasRdKey,
               engine,
               pack,
-              jobActive: job !== null
+              jobActive: job !== null,
+              queueFull
             }
           ) }),
           /* @__PURE__ */ jsx(TabsContent3, { value: "stats", className: "mt-4", children: /* @__PURE__ */ jsxs("div", { className: "space-y-4", children: [

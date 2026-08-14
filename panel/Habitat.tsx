@@ -13,6 +13,7 @@ import { useBbNavigate, useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "../server";
 import type { RpcOutput } from "../overlay/net";
 import { resolveState, type SpriteState } from "../src/atlas";
+import { EMOTION_LABELS, charGeometry, nextFrame, randomBetween } from "../overlay/core";
 import { sounds } from "../overlay/sounds";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -35,6 +36,30 @@ interface Particle {
   char: string;
 }
 
+/** A dropped treat. `x` is its LEFT edge; `yBottom` is measured off the stage
+ *  floor line, exactly like the pet's own `posRef.yBottom`. */
+interface Treat {
+  id: number;
+  x: number;
+  yBottom: number;
+  vy: number;
+  landed: boolean;
+  /** One bounce per treat, then it settles. */
+  bounced: boolean;
+}
+
+interface Ball {
+  x: number;
+  yBottom: number;
+  vx: number;
+  vy: number;
+  phase: "flying" | "rolling" | "carried" | "done";
+  /** Where the throw started — the pet brings the ball back here. */
+  originX: number;
+  bounced: boolean;
+  startedAt: number;
+}
+
 // Target on-screen height of the CHARACTER (not the sprite cell).
 const HABITAT_CHAR_HEIGHT = 80;
 const EDGE_MARGIN = 12;
@@ -55,36 +80,43 @@ const WALK_SPEEDS: Record<string, number> = { chill: 0.6, normal: 1, zoomies: 1.
 const WALK_TO_SPEED = 90;
 const WALK_TO_ARRIVED_PX = 6;
 
-// Transition poses must not restart: sleep plays once then loops only its tail
-// (the breathing lives there); sit plays once and holds its final frame.
-const PLAY_MODES: Partial<
-  Record<SpriteState, { mode: "holdLast" } | { mode: "tailLoop"; tailFraction: number }>
-> = {
-  sleep: { mode: "tailLoop", tailFraction: 0.5 },
-  sit: { mode: "holdLast" },
-};
-
-/** The feeling each sprite state is named as, for the emotion badge. */
-const EMOTION_LABELS: Partial<Record<SpriteState, string>> = {
-  idle: "😌 content",
-  walk: "🚶 wandering",
-  run: "🏃 hustling",
-  think: "🤔 thinking",
-  waiting: "⏳ waiting on you",
-  celebrate: "🎉 celebrating",
-  sad: "😞 down",
-  grumpy: "😾 grumpy",
-  sleep: "💤 asleep",
-  wave: "👋 hello",
-  point: "👉 look",
-  love: "❤️ loved",
-  dig: "⛏️ working",
-  jump: "⬆️ boing",
-  startled: "😳 startled",
-  sit: "🪑 perched",
-  stretch: "🙆 stretching",
-  dance: "🕺 dancing",
-};
+// --- treats + fetch ----------------------------------------------------------
+// Play parity with the overlay, scaled to the stage. Both live entirely in refs
+// (positions written straight onto the DOM node, like the sprite anchor) —
+// React only hears about them when one appears or disappears.
+//
+// The stage floor line sits FLOOR_INSET px up from the stage's bottom edge; the
+// pet anchor is pinned there, so treats and the ball share that origin and every
+// `yBottom` below is "height above the floor line", same frame as the pet's.
+const FLOOR_INSET = 12;
+/** Two on the floor at once is plenty on a stage this size. */
+const TREAT_MAX = 2;
+const TREAT_SIZE = 16;
+/** Treats are lighter than the pet: they drift down rather than plummet. */
+const TREAT_GRAVITY = GRAVITY * 0.6;
+const TREAT_BOUNCE = -0.3;
+/** Where a treat may land, as an inset from each stage edge. */
+const TREAT_MIN_X = 16;
+const TREAT_MAX_INSET = 24;
+/** Close enough to eat, measured centre-to-centre. */
+const TREAT_REACH_PX = 14;
+const BALL_SIZE = 8;
+const BALL_THROW_VY = 320;
+/** Throw speed as a fraction of the stage width — a small stage gets a small
+ *  throw, so the ball never spends the whole game pinballing off the walls. */
+const BALL_THROW_VX_MIN = 0.9;
+const BALL_THROW_VX_SPAN = 0.5;
+/** Rolling friction, expressed per 60fps frame (time-corrected in the tick). */
+const BALL_FRICTION = 0.92;
+const BALL_STOP_VX = 12;
+const BALL_CATCH_PX = 14;
+/** How often the chase re-aims at a moving ball. */
+const BALL_CHASE_MS = 200;
+const BALL_FADE_MS = 1200;
+/** The chase is brisker than an errand — walk speed, boosted. */
+const FETCH_BOOST = 1.6;
+/** A ball nobody ever went after (napping, dragged) gives up. */
+const FETCH_TIMEOUT_MS = 20_000;
 
 /** Lines the habitat pet mutters to itself — sidebar-sized thoughts, kept in
  *  the same lowercase-casual register as the overlay's banks. */
@@ -127,6 +159,12 @@ export function Habitat() {
   const [motes, setMotes] = useState<{ id: number; text: string }[]>([]);
   /** The habitat pet's own little speech bubble, from the director below. */
   const [bubble, setBubble] = useState<{ id: number; text: string } | null>(null);
+  // Spawn/despawn views only — the tick paints positions onto the nodes, so a
+  // falling treat costs no React work at all.
+  const [treatViews, setTreatViews] = useState<{ id: number; x: number; yBottom: number }[]>([]);
+  const [ballView, setBallView] = useState<
+    { key: number; x: number; yBottom: number; fading: boolean } | null
+  >(null);
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const anchorRef = useRef<HTMLDivElement | null>(null);
@@ -172,6 +210,24 @@ export function Habitat() {
   const sizeSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Latest derived display width — drag clamping needs it outside the tick. */
   const widthRef = useRef(HABITAT_CHAR_HEIGHT);
+  /** Latest derived display height — the carried ball rides above the head. */
+  const heightRef = useRef(HABITAT_CHAR_HEIGHT);
+  // --- treats + fetch ---
+  const treatsRef = useRef<Treat[]>([]);
+  /** DOM nodes of the live treats, keyed by id — the loop paints through these. */
+  const treatElsRef = useRef(new Map<number, HTMLElement>());
+  /** id of the treat the pet is currently walking to, if any. */
+  const snackTargetRef = useRef<number | null>(null);
+  const ballRef = useRef<Ball | null>(null);
+  const ballElRef = useRef<HTMLDivElement | null>(null);
+  /** True for the whole fetch (chase AND carry) — it's what boosts walk speed. */
+  const fetchActiveRef = useRef(false);
+  const nextChaseRef = useRef(0);
+  /** Timeouts owned by treats/fetch, so unmount can drop every one of them. */
+  const playTimersRef = useRef(new Set<ReturnType<typeof setTimeout>>());
+  /** The tick calls rpc without wanting to be rebuilt whenever `rpc` changes. */
+  const rpcRef = useRef(rpc);
+  rpcRef.current = rpc;
   const paintedRef = useRef<{
     state: SpriteState | null;
     frame: number;
@@ -221,6 +277,66 @@ export function Habitat() {
 
   useEffect(load, [load]);
 
+  // --- treats + fetch --------------------------------------------------------
+
+  /** A timeout that unmount is guaranteed to clear. */
+  const playTimeout = useCallback((fn: () => void, ms: number) => {
+    const id = setTimeout(() => {
+      playTimersRef.current.delete(id);
+      fn();
+    }, ms);
+    playTimersRef.current.add(id);
+  }, []);
+
+  /** Republish the treat list to React — spawn/despawn only, never per-frame. */
+  const syncTreats = useCallback(() => {
+    setTreatViews(treatsRef.current.map((t) => ({ id: t.id, x: t.x, yBottom: t.yBottom })));
+  }, []);
+
+  /** Drop a treat in at a horizontal fraction of the stage (0..1). */
+  const dropTreatAt = useCallback(
+    (fraction: number) => {
+      const stage = stageRef.current;
+      if (!stage) return;
+      const stageWidth = stage.clientWidth;
+      const maxX = Math.max(TREAT_MIN_X, stageWidth - TREAT_MAX_INSET);
+      const x = Math.min(Math.max(fraction * stageWidth, TREAT_MIN_X), maxX);
+      const treat: Treat = {
+        id: particleSeq++,
+        x,
+        // Straight in off the top edge of the stage, in floor-line coordinates.
+        yBottom: Math.max(0, stage.clientHeight - FLOOR_INSET),
+        vy: 0,
+        landed: false,
+        bounced: false,
+      };
+      // A third treat pushes the oldest one out.
+      const next = [...treatsRef.current, treat].slice(-TREAT_MAX);
+      treatsRef.current = next;
+      for (const id of [...treatElsRef.current.keys()]) {
+        if (!next.some((t) => t.id === id)) treatElsRef.current.delete(id);
+      }
+      if (snackTargetRef.current !== null && !next.some((t) => t.id === snackTargetRef.current)) {
+        snackTargetRef.current = null;
+      }
+      syncTreats();
+    },
+    [syncTreats],
+  );
+
+  /** Tear a fetch down mid-flight: no ball, no boost, no lingering target. */
+  const cancelFetch = useCallback(() => {
+    const had = !!ballRef.current;
+    ballRef.current = null;
+    ballElRef.current = null;
+    fetchActiveRef.current = false;
+    nextChaseRef.current = 0;
+    if (had) {
+      walkTargetRef.current = null;
+      setBallView(null);
+    }
+  }, []);
+
   useRealtime("pets", (payload) => {
     const signal = payload as {
       kind?: string;
@@ -233,6 +349,8 @@ export function Habitat() {
       evolved?: boolean;
       petId?: string;
       job?: unknown;
+      /** treat-drop: horizontal landing spot, as a 0..1 fraction of the stage. */
+      x?: number;
     } | null;
     switch (signal?.kind) {
       case "fleet":
@@ -281,6 +399,12 @@ export function Habitat() {
         }
         break;
       }
+      // The same signal the overlay eats — one channel, both surfaces. The
+      // habitat just scales the landing fraction to the stage instead of the
+      // window.
+      case "treat-drop":
+        dropTreatAt(typeof signal.x === "number" ? signal.x : Math.random());
+        break;
       case "pet-changed":
       case "evolved-art":
       case "hatched":
@@ -329,6 +453,39 @@ export function Habitat() {
     sounds.pet();
     void rpc.call("petPet", { petId: current.id }).catch(() => {});
   }, [burstHearts, rpc]);
+
+  /** Throw the ball. One at a time, and never under reduced motion. */
+  const startFetch = useCallback(() => {
+    const stage = stageRef.current;
+    if (!stage || isReducedMotion() || ballRef.current) return;
+    if (nappingRef.current) setNapping(false);
+    const pos = posRef.current;
+    const width = widthRef.current;
+    const originX = pos.x ?? 0;
+    const center = originX + width / 2;
+    const stageWidth = stage.clientWidth;
+    // Away from the nearest wall, so the throw has room to travel.
+    const direction = center < stageWidth / 2 ? 1 : -1;
+    ballRef.current = {
+      x: center - BALL_SIZE / 2,
+      yBottom: pos.yBottom + heightRef.current * 0.55,
+      vx: direction * stageWidth * (BALL_THROW_VX_MIN + Math.random() * BALL_THROW_VX_SPAN),
+      vy: BALL_THROW_VY,
+      phase: "flying",
+      originX,
+      bounced: false,
+      startedAt: Date.now(),
+    };
+    fetchActiveRef.current = true;
+    nextChaseRef.current = 0;
+    setBallView({
+      key: Date.now(),
+      x: ballRef.current.x,
+      yBottom: ballRef.current.yBottom,
+      fading: false,
+    });
+    sounds.boing();
+  }, [isReducedMotion]);
 
   const goToNeediest = useCallback(() => {
     void rpc
@@ -452,23 +609,7 @@ export function Habitat() {
           frameClockRef.current %= 1;
           const raw = rawFrameRef.current + 1;
           rawFrameRef.current = raw;
-          // `nextState` is the RESOLVED state actually being drawn, so a
-          // fallback pose obeys the play mode of the state it stands in for.
-          const pm = PLAY_MODES[nextState];
-          if (!pm || raw < spec.frames) {
-            frameRef.current =
-              pm && raw < spec.frames
-                ? raw
-                : spec.loop
-                  ? raw % spec.frames
-                  : Math.min(raw, spec.frames - 1);
-          } else if (pm.mode === "holdLast") {
-            frameRef.current = spec.frames - 1;
-          } else {
-            const tailLen = Math.max(1, Math.round(spec.frames * pm.tailFraction));
-            const tailStart = spec.frames - tailLen;
-            frameRef.current = tailStart + ((raw - spec.frames) % tailLen);
-          }
+          frameRef.current = nextFrame(raw, spec, nextState);
         }
       }
 
@@ -480,19 +621,11 @@ export function Habitat() {
       const ready = !!img && img.complete && img.naturalWidth > 0;
       const srcCellW = ready ? Math.floor(img.naturalWidth / spec.frames) : spec.width / spec.frames;
       const srcH = ready ? img.naturalHeight : spec.height;
-      // Character-normalized ONCE, against the IDLE pose: one uniform pixel
-      // scale per pet. Measuring the CURRENT pose instead inflated naturally
-      // short poses (sleeping, sitting, digging) back up to standing height,
-      // so the pet visibly ballooned/shrank whenever a reaction changed state.
-      // Anchored to idle, poses differ in height because the POSE differs.
-      const idleSpec = atlas.states[resolveState(atlas.states, "idle")] ?? spec;
-      const refContentH = Math.max(1, idleSpec.contentHeight ?? idleSpec.height);
       const petScale = petRef.current?.sizeScale ?? 1;
       const charTarget = HABITAT_CHAR_HEIGHT * petScale;
-      const pixelScale = charTarget / refContentH;
-      const height = spec.height * pixelScale;
-      const width = srcCellW * pixelScale;
+      const { width, height } = charGeometry(atlas, spec, srcCellW, charTarget);
       widthRef.current = width;
+      heightRef.current = height;
 
       const pos = posRef.current;
       const vel = velRef.current;
@@ -533,6 +666,173 @@ export function Habitat() {
       pos.x = Math.min(Math.max(pos.x, minX), maxX);
       pos.yBottom = Math.min(pos.yBottom, Math.max(0, stageHeight - 100));
 
+      // --- treats + fetch ----------------------------------------------------
+      // Runs BEFORE the walk-to block below, so a destination chosen here is
+      // acted on in the same frame rather than one behind.
+      const playNow = Date.now();
+      const treats = treatsRef.current;
+
+      // Falling treats: lighter gravity, one bounce, then they sit there.
+      for (const treat of treats) {
+        if (treat.landed) continue;
+        treat.vy -= TREAT_GRAVITY * dt;
+        treat.yBottom += treat.vy * dt;
+        if (treat.yBottom <= 0) {
+          treat.yBottom = 0;
+          // Reduced motion: no bounce, the treat simply arrives.
+          if (!reducedMotion && !treat.bounced && Math.abs(treat.vy) > 120) {
+            treat.bounced = true;
+            treat.vy *= TREAT_BOUNCE;
+          } else {
+            treat.vy = 0;
+            treat.landed = true;
+          }
+        }
+      }
+
+      // Free = nothing with a stronger claim on the pet's attention.
+      const playMoment = momentRef.current;
+      const petFree =
+        !airborneRef.current &&
+        !nappingRef.current &&
+        !dragRef.current &&
+        !(playMoment && playNow < playMoment.until);
+
+      // Snack run: walk to the chosen treat (clicked, else nearest) and eat it.
+      if (treats.length > 0 && !ballRef.current) {
+        let target: Treat | null = null;
+        if (snackTargetRef.current !== null) {
+          target = treats.find((t) => t.id === snackTargetRef.current) ?? null;
+          if (!target) snackTargetRef.current = null;
+        }
+        if (!target && petFree && walkTargetRef.current === null) {
+          const center = pos.x + width / 2;
+          let bestDistance = Number.POSITIVE_INFINITY;
+          for (const treat of treats) {
+            if (!treat.landed) continue;
+            const distance = Math.abs(treat.x + TREAT_SIZE / 2 - center);
+            if (distance < bestDistance) {
+              bestDistance = distance;
+              target = treat;
+            }
+          }
+          if (target) snackTargetRef.current = target.id;
+        }
+        if (target && target.landed && petFree) {
+          const treatCenter = target.x + TREAT_SIZE / 2;
+          if (Math.abs(pos.x + width / 2 - treatCenter) < TREAT_REACH_PX) {
+            const eaten = target;
+            treatsRef.current = treats.filter((t) => t.id !== eaten.id);
+            treatElsRef.current.delete(eaten.id);
+            snackTargetRef.current = null;
+            walkTargetRef.current = null;
+            momentRef.current = { state: "love", until: playNow + 1200 };
+            burstHearts();
+            pulseClass("pets-land", 200);
+            sounds.pet();
+            void rpcRef.current.call("eatTreat").catch(() => {});
+            syncTreats();
+          } else {
+            facingRef.current = treatCenter >= pos.x + width / 2 ? 1 : -1;
+            walkTargetRef.current = Math.min(Math.max(treatCenter - width / 2, minX), maxX);
+          }
+        }
+      }
+
+      // Paint every live treat (cheap: at most two nodes).
+      for (const treat of treatsRef.current) {
+        const node = treatElsRef.current.get(treat.id);
+        if (node) node.style.transform = `translate(${treat.x}px, ${-treat.yBottom}px)`;
+      }
+
+      // --- fetch ---
+      const ball = ballRef.current;
+      if (ball) {
+        const ballMinX = EDGE_MARGIN;
+        const ballMaxX = Math.max(ballMinX, stage.clientWidth - EDGE_MARGIN - BALL_SIZE);
+        if (ball.phase === "flying") {
+          ball.vy -= GRAVITY * dt;
+          ball.x += ball.vx * dt;
+          ball.yBottom += ball.vy * dt;
+          if (ball.x <= ballMinX || ball.x >= ballMaxX) {
+            ball.x = Math.min(Math.max(ball.x, ballMinX), ballMaxX);
+            ball.vx = -ball.vx * WALL_BOUNCE;
+          }
+          if (ball.yBottom <= 0) {
+            ball.yBottom = 0;
+            // Exactly one floor bounce, then it rolls.
+            if (!ball.bounced && Math.abs(ball.vy) > SETTLE_VY) {
+              ball.bounced = true;
+              ball.vy = -ball.vy * FLOOR_BOUNCE;
+              ball.vx *= 0.8;
+            } else {
+              ball.vy = 0;
+              ball.phase = "rolling";
+            }
+          }
+        } else if (ball.phase === "rolling") {
+          ball.x += ball.vx * dt;
+          // Per-frame friction, corrected for the actual frame length.
+          ball.vx *= Math.pow(BALL_FRICTION, dt * 60);
+          if (Math.abs(ball.vx) < BALL_STOP_VX) ball.vx = 0;
+          if (ball.x <= ballMinX || ball.x >= ballMaxX) {
+            ball.x = Math.min(Math.max(ball.x, ballMinX), ballMaxX);
+            ball.vx = -ball.vx * WALL_BOUNCE;
+          }
+          ball.yBottom = 0;
+        } else if (ball.phase === "carried") {
+          // Rides above the pet's head, wherever that is.
+          ball.x = pos.x + width / 2 - BALL_SIZE / 2;
+          ball.yBottom = pos.yBottom + height * 0.9;
+        }
+
+        if (ball.phase === "flying" || ball.phase === "rolling") {
+          if (playNow - ball.startedAt > FETCH_TIMEOUT_MS) {
+            // Nobody came for it. Rather than leave a ball (and a speed boost)
+            // on the floor forever, call the game off.
+            cancelFetch();
+          } else if (petFree) {
+            const ballCenter = ball.x + BALL_SIZE / 2;
+            if (playNow >= nextChaseRef.current) {
+              nextChaseRef.current = playNow + BALL_CHASE_MS;
+              walkTargetRef.current = Math.min(Math.max(ballCenter - width / 2, minX), maxX);
+            }
+            const grounded = ball.phase === "rolling" || ball.yBottom <= 2;
+            if (grounded && Math.abs(pos.x + width / 2 - ballCenter) < BALL_CATCH_PX) {
+              ball.phase = "carried";
+              ball.vx = 0;
+              ball.vy = 0;
+              nextChaseRef.current = 0;
+              sounds.pet();
+              walkTargetRef.current = Math.min(Math.max(ball.originX, minX), maxX);
+            }
+          }
+        } else if (ball.phase === "carried" && walkTargetRef.current === null && petFree) {
+          // Home again: drop it at the pet's feet and let it fade out.
+          ball.phase = "done";
+          ball.x = pos.x + width / 2 - BALL_SIZE / 2;
+          ball.yBottom = 0;
+          fetchActiveRef.current = false;
+          momentRef.current = { state: "celebrate", until: playNow + 1400 };
+          sounds.pet();
+          void rpcRef.current.call("recordFetch").catch(() => {});
+          // Hand the LIVE position to React alongside the fade, so the
+          // re-render can't snap the ball back to where it was thrown from.
+          const restX = ball.x;
+          const restY = ball.yBottom;
+          setBallView((prev) =>
+            prev ? { ...prev, x: restX, yBottom: restY, fading: true } : prev,
+          );
+          playTimeout(() => {
+            if (ballRef.current?.phase === "done") ballRef.current = null;
+            setBallView(null);
+          }, BALL_FADE_MS);
+        }
+
+        const ballNode = ballElRef.current;
+        if (ballNode) ballNode.style.transform = `translate(${ball.x}px, ${-ball.yBottom}px)`;
+      }
+
       // --- ground-tap walk-to (outranks roaming while a target stands) ---
       const frozen = !!dragRef.current;
       const walkTarget = walkTargetRef.current;
@@ -551,7 +851,9 @@ export function Habitat() {
           } else {
             const direction = (delta > 0 ? 1 : -1) as 1 | -1;
             const speedFactor = WALK_SPEEDS[settingsRef.current?.walkSpeed ?? "normal"] ?? 1;
-            const step = WALK_TO_SPEED * speedFactor * dt;
+            // Fetch is a sprint, not an errand.
+            const boost = fetchActiveRef.current ? FETCH_BOOST : 1;
+            const step = WALK_TO_SPEED * speedFactor * boost * dt;
             pos.x = Math.abs(delta) <= step ? goal : pos.x + direction * step;
             facingRef.current = direction;
           }
@@ -664,11 +966,30 @@ export function Habitat() {
 
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [pet, deriveState, isReducedMotion, pulseClass]);
+  }, [
+    pet,
+    deriveState,
+    isReducedMotion,
+    pulseClass,
+    burstHearts,
+    cancelFetch,
+    playTimeout,
+    syncTreats,
+  ]);
 
   useEffect(() => {
+    const playTimers = playTimersRef.current;
     return () => {
       if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
+      // Nothing from a game outlives the habitat.
+      for (const id of playTimers) clearTimeout(id);
+      playTimers.clear();
+      treatsRef.current = [];
+      treatElsRef.current.clear();
+      snackTargetRef.current = null;
+      ballRef.current = null;
+      ballElRef.current = null;
+      fetchActiveRef.current = false;
     };
   }, []);
 
@@ -777,7 +1098,7 @@ export function Habitat() {
           walkTargetRef.current !== null;
         if (!busy) act();
         schedule();
-      }, min + Math.random() * (max - min));
+      }, randomBetween(min, max));
     };
 
     schedule();
@@ -796,6 +1117,10 @@ export function Habitat() {
     const pos = posRef.current;
     airborneRef.current = false;
     velRef.current = { vx: 0, vy: 0 };
+    // Picked up mid-game: the ball is off, and whatever snack was being walked
+    // to stops being an instruction.
+    cancelFetch();
+    snackTargetRef.current = null;
     dragRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -969,6 +1294,64 @@ export function Habitat() {
         onPointerDown={onStagePointerDown}
       >
         <div className="absolute inset-x-0 bottom-3 border-t border-border/60" />
+        {treatViews.map((treat) => (
+          <span
+            key={treat.id}
+            ref={(node) => {
+              if (node) treatElsRef.current.set(treat.id, node);
+              else treatElsRef.current.delete(treat.id);
+            }}
+            role="button"
+            tabIndex={0}
+            aria-label="A treat"
+            title="A treat"
+            className="absolute left-0 select-none leading-none"
+            style={{
+              bottom: FLOOR_INSET,
+              fontSize: TREAT_SIZE,
+              pointerEvents: "auto",
+              cursor: "pointer",
+              willChange: "transform",
+              transform: `translate(${treat.x}px, ${-treat.yBottom}px)`,
+            }}
+            onPointerDown={(event) => {
+              // Don't let the stage read this as a "walk over there" ground tap.
+              event.stopPropagation();
+              snackTargetRef.current = treat.id;
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              snackTargetRef.current = treat.id;
+            }}
+          >
+            🍪
+          </span>
+        ))}
+        {ballView ? (
+          <motion.div
+            key={ballView.key}
+            ref={ballElRef}
+            aria-hidden="true"
+            className="absolute left-0"
+            style={{
+              bottom: FLOOR_INSET,
+              boxSizing: "border-box",
+              width: BALL_SIZE,
+              height: BALL_SIZE,
+              borderRadius: 2,
+              background: "var(--primary, rgb(120 160 255))",
+              border: "2px solid rgb(0 0 0 / 0.45)",
+              imageRendering: "pixelated",
+              pointerEvents: "none",
+              willChange: "transform",
+              transform: `translate(${ballView.x}px, ${-ballView.yBottom}px)`,
+            }}
+            initial={{ opacity: 1 }}
+            animate={{ opacity: ballView.fading ? 0 : 1 }}
+            transition={{ duration: ballView.fading ? BALL_FADE_MS / 1000 : 0, ease: "linear" }}
+          />
+        ) : null}
         <div ref={anchorRef} className="absolute left-0" style={{ bottom: 12 }}>
           {settingsRef.current?.showEmotions ? (
             <AnimatePresence mode="wait">
@@ -1040,6 +1423,18 @@ export function Habitat() {
         <Button size="sm" variant="outline" onClick={toggleNap}>
           {napping ? "Wake up" : "Nap"}
         </Button>
+        {isReducedMotion() ? null : (
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-8 w-8"
+            aria-label="Play fetch"
+            disabled={!!ballView}
+            onClick={startFetch}
+          >
+            🎾
+          </Button>
+        )}
         <Button size="sm" variant="outline" onClick={goToNeediest}>
           What needs attention?
         </Button>

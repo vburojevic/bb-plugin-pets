@@ -179,7 +179,10 @@
   pointer-events: auto;
   position: absolute;
   bottom: calc(100% + 12px);
-  max-width: 240px;
+  /* The JS clamp keeps the bubble's left edge inside the window; this keeps it
+     from being wider than the window in the first place, which is the one case
+     the clamp cannot solve. Both use the same 8px keep-out. */
+  max-width: min(240px, calc(100vw - 16px));
   width: max-content;
   text-align: left;
   font-size: 12px;

@@ -195,6 +195,9 @@ export const rpcContract = defineRpcContract({
       engine: z.string(),
       /** Configured animation pack: essential | expanded | deluxe. */
       pack: z.string(),
+      /** Identity of the frontend bundle this server booted with; a change
+       * across fetches means the overlay is running stale code. */
+      bundleStamp: z.string(),
     }),
   },
   listDen: {
@@ -407,9 +410,31 @@ export const rpcContract = defineRpcContract({
       lastError: z
         .object({ phase: z.string(), subject: z.string(), message: z.string(), at: z.number() })
         .nullable(),
+      // Jobs waiting behind the active one, in the order they will run.
+      queued: z.array(
+        z.object({ jobId: z.string(), phase: z.string(), subject: z.string() }),
+      ),
     }),
   },
 });
+
+// Identity of the frontend bundle this server booted with, read once. The
+// overlay snapshots it on its first fetch and nudges for a reload when a later
+// fetch reports a different stamp (bb rebuilt and restarted the plugin under a
+// long-lived window). Falls back to boot time so a missing dist still yields a
+// stable per-boot value.
+let bundleStamp = "";
+try {
+  const stampModuleDir = path.dirname(fileURLToPath(import.meta.url));
+  const stampPluginRoot = existsSync(path.join(stampModuleDir, "assets"))
+    ? stampModuleDir
+    : path.join(stampModuleDir, "..");
+  bundleStamp = String(
+    Math.round(statSync(path.join(stampPluginRoot, "dist/app.meta.json")).mtimeMs),
+  );
+} catch {
+  bundleStamp = String(Date.now());
+}
 
 interface PetRow {
   id: string;
@@ -859,7 +884,7 @@ export default async function plugin(bb: BbPluginApi) {
       publishTimer = null;
       if (pluginDisposed) return;
       try {
-        bb.realtime.publish("pets", { kind: "fleet", fleet: snapshot(fleet) });
+        bb.realtime.publish("pets", { kind: "fleet", fleet: snapshot(fleet), bundleStamp });
       } catch {
         // disposed between the check and the publish — nothing to do
       }
@@ -961,6 +986,12 @@ export default async function plugin(bb: BbPluginApi) {
     });
     if (after.index > before.index) {
       bb.log.info(`${pet.name} evolved: ${before.name} → ${after.name} at ${xp} XP`);
+      // The new stage outruns the artwork until the glow up runs — say so once.
+      try {
+        nudgeGlowup(pet, after);
+      } catch (error) {
+        bb.log.warn(`glow-up nudge failed: ${String(error)}`);
+      }
     }
   };
 
@@ -982,8 +1013,40 @@ export default async function plugin(bb: BbPluginApi) {
     insertDiaryStmt.run(petId, Date.now(), kind, text);
   };
 
+  /** A pet whose art stage trails its XP stage has a glow up waiting. Drops a
+   * diary line and one signal the overlay turns into a bubble. `oncePerDay`
+   * keeps the ambient (daily-greet) reminder from repeating all day; the
+   * stage-up path passes false so the moment itself always lands. */
+  const nudgeGlowup = (
+    pet: PetRow,
+    stage: ReturnType<typeof stageForXp>,
+    oncePerDay = false,
+  ) => {
+    if (pet.art_stage >= stage.index) return;
+    if (oncePerDay) {
+      const seen = countDiarySinceStmt.get(pet.id, "glowup-nudge", localMidnight()) as { n: number };
+      if (seen.n > 0) return;
+    }
+    writeDiary(
+      pet.id,
+      "glowup-nudge",
+      "i've outgrown this look. the glow up button is right there.",
+      true,
+    );
+    if (pluginDisposed) return;
+    bb.realtime.publish("pets", { kind: "glowup-available", petId: pet.id, stageName: stage.name });
+  };
+
   const maybeDailyBonus = () => {
     awardXp("daily-greeting", null, `daily:${dayKey(new Date())}`);
+    // An already-lagging pet never sees a fresh stage-up, so the daily greeting
+    // is where it gets its one gentle reminder of the day.
+    try {
+      const pet = getActivePet();
+      if (pet) nudgeGlowup(pet, stageForXp(pet.xp), true);
+    } catch (error) {
+      bb.log.warn(`glow-up nudge failed: ${String(error)}`);
+    }
   };
 
   // --- treats wallet ---------------------------------------------------------
@@ -1170,19 +1233,42 @@ export default async function plugin(bb: BbPluginApi) {
     createdAt: number;
   }
 
-  let generationBusy = false;
+  // Generation runs one job at a time, but waiting jobs line up instead of
+  // being rejected: "fix animations" no longer blocks a hatch. The queue is
+  // strictly FIFO and bounded — an unbounded queue would let a few impatient
+  // clicks commit the user to an hour of image spend.
+  const MAX_JOBS = 3;
+  const jobQueue: Array<{ jobId: string; phase: string; subject: string; start: () => void }> = [];
+  let activeJob = false;
 
   // Draft refinement is a single quick edits call, independent of the strip
-  // pipeline — it gets its own latch instead of the one job slot, so a user
-  // can tweak a draft while nothing else is running.
+  // pipeline — it gets its own latch instead of the job queue, so a user
+  // can tweak a draft while generation runs.
   let refineBusy = false;
 
-  // The busy check and the claim must be one synchronous step: every job
-  // starter awaits settings/engine config before reaching runJob, so a plain
-  // `if (generationBusy)` guard lets two concurrent rpc calls both pass.
-  const acquireJobSlot = () => {
-    if (generationBusy) throw new Error("Already generating — one job at a time.");
-    generationBusy = true;
+  const queuedView = () =>
+    jobQueue.map(({ jobId, phase, subject }) => ({ jobId, phase, subject }));
+
+  const pump = () => {
+    if (activeJob) return;
+    const next = jobQueue.shift();
+    if (!next) return;
+    activeJob = true;
+    next.start();
+  };
+
+  // The capacity check and the enqueue must be one synchronous step: every job
+  // starter awaits settings/engine config before it gets here, so a check made
+  // earlier in the handler would let concurrent rpc calls both pass.
+  const enqueueJob = (jobId: string, phase: string, subject: string, run: () => void) => {
+    if (jobQueue.length + (activeJob ? 1 : 0) >= MAX_JOBS) {
+      throw new Error("Queue is full — try again when the current jobs finish.");
+    }
+    jobQueue.push({ jobId, phase, subject, start: run });
+    pump();
+    // pump() already published if this job started; publish anyway so a job
+    // that merely joined the queue shows up in the banner immediately.
+    publishJob();
   };
 
   const engineConfig = async (): Promise<SpriteEngines> => {
@@ -1264,7 +1350,7 @@ export default async function plugin(bb: BbPluginApi) {
   let lastJobError: { phase: string; subject: string; message: string; at: number } | null = null;
 
   const publishJob = () => {
-    bb.realtime.publish("pets", { kind: "job", job: currentJob });
+    bb.realtime.publish("pets", { kind: "job", job: currentJob, queued: queuedView() });
   };
 
   const publishProgress = (
@@ -1294,6 +1380,10 @@ export default async function plugin(bb: BbPluginApi) {
   bb.onDispose(() => {
     for (const controller of jobControllers) controller.abort();
     jobControllers.clear();
+    // Drain the queue synchronously, before the aborted job's finally-block
+    // (a microtask away) can call pump() and start a job on a dead handle.
+    jobQueue.length = 0;
+    activeJob = false;
   });
 
   const runJob = (
@@ -1304,7 +1394,6 @@ export default async function plugin(bb: BbPluginApi) {
     states: string[],
     work: (signal: AbortSignal) => Promise<void>,
   ) => {
-    generationBusy = true;
     const controller = new AbortController();
     jobControllers.add(controller);
     currentJob = {
@@ -1357,13 +1446,16 @@ export default async function plugin(bb: BbPluginApi) {
       .finally(() => {
         clearInterval(heartbeat);
         jobControllers.delete(controller);
-        generationBusy = false;
+        activeJob = false;
         currentJob = null;
         try {
           publishJob();
         } catch {
           // disposed mid-teardown — clients re-sync via getJobStatus
         }
+        // Hand the slot to whoever is next. After dispose the queue is
+        // already empty, so this is a no-op on a torn-down load.
+        pump();
       });
   };
 
@@ -1460,6 +1552,7 @@ export default async function plugin(bb: BbPluginApi) {
         engine:
           stripEngine === "retro-diffusion" ? "retro-diffusion" : `openai:${values.imageModel}`,
         pack: values.animationPack,
+        bundleStamp,
       };
     },
     async setBehavior({ key, value }) {
@@ -1544,7 +1637,7 @@ export default async function plugin(bb: BbPluginApi) {
     deletePet({ petId }) {
       const row = db.prepare(`SELECT * FROM pets WHERE id = ?`).get(petId) as PetRow | undefined;
       if (!row) return { ok: false };
-      if (generationBusy)
+      if (activeJob || jobQueue.length > 0)
         throw new Error("A generation job is running — wait for it to finish first.");
       if (row.active === 1) throw new Error("Choose another companion first — the active pet can't be deleted.");
       db.transaction(() => {
@@ -1605,16 +1698,11 @@ export default async function plugin(bb: BbPluginApi) {
       return { threads };
     },
     async hatchDrafts({ description }) {
-      acquireJobSlot();
-      let engines: SpriteEngines;
-      try {
-        engines = await engineConfig();
-      } catch (error) {
-        generationBusy = false;
-        throw error;
-      }
+      // Validation stays synchronous-at-rpc-time: a bad key or a missing draft
+      // must fail the call, not a job that starts ten minutes later.
+      const engines = await engineConfig();
       const jobId = `job_${randomUUID().slice(0, 8)}`;
-      runJob(jobId, "drafts", description, 4, [], async (signal) => {
+      const work = async (signal: AbortSignal) => {
         publishProgress(jobId, "drafts", 0, 4, "Imagining candidates…");
         const buffers = await generateHeroDrafts(
           engines,
@@ -1643,12 +1731,15 @@ export default async function plugin(bb: BbPluginApi) {
           jobId,
           drafts: metas.map(draftView),
         });
+      };
+      enqueueJob(jobId, "drafts", description, () => {
+        runJob(jobId, "drafts", description, 4, [], work);
       });
       return { jobId };
     },
     async listDrafts() {
       const metas = await getDraftMetas();
-      return { drafts: metas.map(draftView), generating: generationBusy };
+      return { drafts: metas.map(draftView), generating: activeJob };
     },
     async refineDraft({ draftId, instruction }) {
       if (!/^[a-z0-9-]+$/.test(draftId)) throw new Error("That draft is gone. Generate new ones.");
@@ -1668,22 +1759,13 @@ export default async function plugin(bb: BbPluginApi) {
       }
     },
     async hatchCommit({ draftId, name, description }) {
-      acquireJobSlot();
-      let engines: SpriteEngines;
-      let hero: Buffer;
-      let states: Awaited<ReturnType<typeof packStates>>;
-      try {
-        const heroPath = path.join(draftsDir, `${draftId}.png`);
-        if (!existsSync(heroPath)) throw new Error("That draft is gone. Generate new ones.");
-        engines = await engineConfig();
-        hero = readFileSync(heroPath);
-        states = await packStates();
-      } catch (error) {
-        generationBusy = false;
-        throw error;
-      }
+      const heroPath = path.join(draftsDir, `${draftId}.png`);
+      if (!existsSync(heroPath)) throw new Error("That draft is gone. Generate new ones.");
+      const engines = await engineConfig();
+      const hero = readFileSync(heroPath);
+      const states = await packStates();
       const jobId = `job_${randomUUID().slice(0, 8)}`;
-      runJob(jobId, "hatch", name.trim(), states.length, [...states], async (signal) => {
+      const work = async (signal: AbortSignal) => {
         const petId = `pet-${randomUUID().slice(0, 8)}`;
         const sideHero = needsSideHero(engines, states)
           ? await ensureSideHero({ id: petId } as PetRow, engines, hero)
@@ -1708,6 +1790,9 @@ export default async function plugin(bb: BbPluginApi) {
             jobId,
             phase: "hatch",
             subject: name.trim(),
+            // The pet row lands a few lines below, but the id is already
+            // final — the panel can offer a retry against it.
+            petId,
             skipped: result.skipped,
           });
         }
@@ -1727,38 +1812,28 @@ export default async function plugin(bb: BbPluginApi) {
         }
         bb.realtime.publish("pets", { kind: "hatched", jobId, petId });
         bb.realtime.publish("pets", { kind: "pet-changed", petId });
+      };
+      enqueueJob(jobId, "hatch", name.trim(), () => {
+        runJob(jobId, "hatch", name.trim(), states.length, [...states], work);
       });
       return { jobId };
     },
     async evolveArt({ petId }) {
-      acquireJobSlot();
-      let row: PetRow;
-      let stage: ReturnType<typeof stageForXp>;
-      let modifier: string;
-      let engines: SpriteEngines;
-      let hero: Buffer;
-      let states: Awaited<ReturnType<typeof packStates>>;
-      try {
-        const found = db.prepare(`SELECT * FROM pets WHERE id = ?`).get(petId) as PetRow | undefined;
-        if (!found) throw new Error("Unknown pet.");
-        row = found;
-        stage = stageForXp(row.xp);
-        if (stage.index <= row.art_stage)
-          throw new Error(`${row.name}'s artwork is already current.`);
-        const stageModifier = STAGE_MODIFIERS[stage.index];
-        if (!stageModifier) throw new Error("No look defined for this stage.");
-        modifier = stageModifier;
-        const heroPath = heroPathFor(row);
-        if (!existsSync(heroPath)) throw new Error("No hero portrait for this pet.");
-        engines = await engineConfig();
-        hero = readFileSync(heroPath);
-        states = await packStates();
-      } catch (error) {
-        generationBusy = false;
-        throw error;
-      }
+      const found = db.prepare(`SELECT * FROM pets WHERE id = ?`).get(petId) as PetRow | undefined;
+      if (!found) throw new Error("Unknown pet.");
+      const row = found;
+      const stage = stageForXp(row.xp);
+      if (stage.index <= row.art_stage)
+        throw new Error(`${row.name}'s artwork is already current.`);
+      const modifier = STAGE_MODIFIERS[stage.index];
+      if (!modifier) throw new Error("No look defined for this stage.");
+      const heroPath = heroPathFor(row);
+      if (!existsSync(heroPath)) throw new Error("No hero portrait for this pet.");
+      const engines = await engineConfig();
+      const hero = readFileSync(heroPath);
+      const states = await packStates();
       const jobId = `job_${randomUUID().slice(0, 8)}`;
-      runJob(jobId, "evolve", row.name, states.length + 1, [...states], async (signal) => {
+      const work = async (signal: AbortSignal) => {
         publishProgress(jobId, "evolve", 0, states.length + 1, "Redrawing the hero…");
         const evolved = await evolveHero(engines, hero, row.description, modifier, signal);
         if (signal.aborted) return;
@@ -1793,6 +1868,7 @@ export default async function plugin(bb: BbPluginApi) {
             jobId,
             phase: "evolve",
             subject: row.name,
+            petId: row.id,
             skipped: result.skipped,
           });
         }
@@ -1820,30 +1896,23 @@ export default async function plugin(bb: BbPluginApi) {
         }
         bb.realtime.publish("pets", { kind: "evolved-art", jobId, petId: row.id });
         bb.realtime.publish("pets", { kind: "pet-changed", petId: row.id });
+      };
+      enqueueJob(jobId, "evolve", row.name, () => {
+        runJob(jobId, "evolve", row.name, states.length + 1, [...states], work);
       });
       return { jobId };
     },
     async refreshArt({ petId }) {
-      acquireJobSlot();
-      let row: PetRow;
-      let engines: SpriteEngines;
-      let hero: Buffer;
-      let states: Awaited<ReturnType<typeof packStates>>;
-      try {
-        const found = db.prepare(`SELECT * FROM pets WHERE id = ?`).get(petId) as PetRow | undefined;
-        if (!found) throw new Error("Unknown pet.");
-        row = found;
-        const heroPath = heroPathFor(row);
-        if (!existsSync(heroPath)) throw new Error("No hero portrait for this pet.");
-        engines = await engineConfig();
-        hero = readFileSync(heroPath);
-        states = await packStates();
-      } catch (error) {
-        generationBusy = false;
-        throw error;
-      }
+      const found = db.prepare(`SELECT * FROM pets WHERE id = ?`).get(petId) as PetRow | undefined;
+      if (!found) throw new Error("Unknown pet.");
+      const row = found;
+      const heroPath = heroPathFor(row);
+      if (!existsSync(heroPath)) throw new Error("No hero portrait for this pet.");
+      const engines = await engineConfig();
+      const hero = readFileSync(heroPath);
+      const states = await packStates();
       const jobId = `job_${randomUUID().slice(0, 8)}`;
-      runJob(jobId, "refresh", row.name, states.length, [...states], async (signal) => {
+      const work = async (signal: AbortSignal) => {
         const sideHero = needsSideHero(engines, states)
           ? await ensureSideHero(row, engines, hero)
           : undefined;
@@ -1867,87 +1936,79 @@ export default async function plugin(bb: BbPluginApi) {
             jobId,
             phase: "refresh",
             subject: row.name,
+            petId: row.id,
             skipped: result.skipped,
           });
         }
         saveStrips(row.id, row.art_stage, result);
         bb.realtime.publish("pets", { kind: "evolved-art", jobId, petId: row.id });
         bb.realtime.publish("pets", { kind: "pet-changed", petId: row.id });
+      };
+      enqueueJob(jobId, "refresh", row.name, () => {
+        runJob(jobId, "refresh", row.name, states.length, [...states], work);
       });
       return { jobId };
     },
     async regenerateStates(input) {
-      acquireJobSlot();
-      let row: PetRow;
-      let engines: SpriteEngines;
-      let hero: Buffer;
-      let requested: SpriteState[];
-      try {
-        const found = db
-          .prepare(`SELECT * FROM pets WHERE id = ?`)
-          .get(input.petId) as PetRow | undefined;
-        if (!found) throw new Error("Unknown pet.");
-        row = found;
-        requested = input.states.filter(isSpriteState);
-        if (requested.length === 0) throw new Error("No valid states.");
-        const heroPath = heroPathFor(row);
-        if (!existsSync(heroPath)) throw new Error("No hero portrait for this pet.");
-        engines = await engineConfig();
-        hero = readFileSync(heroPath);
-      } catch (error) {
-        generationBusy = false;
-        throw error;
-      }
+      const found = db
+        .prepare(`SELECT * FROM pets WHERE id = ?`)
+        .get(input.petId) as PetRow | undefined;
+      if (!found) throw new Error("Unknown pet.");
+      const row = found;
+      const requested = input.states.filter(isSpriteState);
+      if (requested.length === 0) throw new Error("No valid states.");
+      const heroPath = heroPathFor(row);
+      if (!existsSync(heroPath)) throw new Error("No hero portrait for this pet.");
+      const engines = await engineConfig();
+      const hero = readFileSync(heroPath);
       const jobId = `job_${randomUUID().slice(0, 8)}`;
-      runJob(
-        jobId,
-        "refresh",
-        `${row.name} (${requested.join(", ")})`,
-        requested.length,
-        [...requested],
-        async (signal) => {
-          const sideHero = needsSideHero(engines, requested)
-            ? await ensureSideHero(row, engines, hero)
-            : undefined;
-          if (signal.aborted) return;
-          const result = await generateStrips(
-            engines,
-            hero,
-            (done, total, state) => {
-              if (!signal.aborted)
-                publishProgress(jobId, "refresh", done, total, `Animated ${state}`, state);
-            },
-            signal,
-            requested,
-            sideHero,
+      const subject = `${row.name} (${requested.join(", ")})`;
+      const work = async (signal: AbortSignal) => {
+        const sideHero = needsSideHero(engines, requested)
+          ? await ensureSideHero(row, engines, hero)
+          : undefined;
+        if (signal.aborted) return;
+        const result = await generateStrips(
+          engines,
+          hero,
+          (done, total, state) => {
+            if (!signal.aborted)
+              publishProgress(jobId, "refresh", done, total, `Animated ${state}`, state);
+          },
+          signal,
+          requested,
+          sideHero,
+        );
+        if (signal.aborted) return;
+        if (result.skipped.length > 0) {
+          bb.log.warn(
+            `${jobId}: skipped ${result.skipped.map((s) => `${s.state} (${s.reason})`).join(", ")}`,
           );
-          if (signal.aborted) return;
-          if (result.skipped.length > 0) {
-            bb.log.warn(
-              `${jobId}: skipped ${result.skipped.map((s) => `${s.state} (${s.reason})`).join(", ")}`,
-            );
-            bb.realtime.publish("pets", {
-              kind: "gen-warning",
-              jobId,
-              phase: "refresh",
-              subject: row.name,
-              skipped: result.skipped,
-            });
-          }
-          saveStrips(row.id, row.art_stage, result);
-          try {
-            writeDiary(row.id, "touchup", `got my ${requested.join(" and ")} redrawn. felt nothing.`);
-          } catch (error) {
-            bb.log.warn(`diary touchup write failed: ${String(error)}`);
-          }
-          bb.realtime.publish("pets", { kind: "evolved-art", jobId, petId: row.id });
-          bb.realtime.publish("pets", { kind: "pet-changed", petId: row.id });
-        },
-      );
+          bb.realtime.publish("pets", {
+            kind: "gen-warning",
+            jobId,
+            phase: "refresh",
+            subject: row.name,
+            petId: row.id,
+            skipped: result.skipped,
+          });
+        }
+        saveStrips(row.id, row.art_stage, result);
+        try {
+          writeDiary(row.id, "touchup", `got my ${requested.join(" and ")} redrawn. felt nothing.`);
+        } catch (error) {
+          bb.log.warn(`diary touchup write failed: ${String(error)}`);
+        }
+        bb.realtime.publish("pets", { kind: "evolved-art", jobId, petId: row.id });
+        bb.realtime.publish("pets", { kind: "pet-changed", petId: row.id });
+      };
+      enqueueJob(jobId, "refresh", subject, () => {
+        runJob(jobId, "refresh", subject, requested.length, [...requested], work);
+      });
       return { jobId };
     },
     getJobStatus() {
-      return { job: currentJob, lastError: lastJobError };
+      return { job: currentJob, lastError: lastJobError, queued: queuedView() };
     },
     getStats() {
       const pet = getActivePet();
@@ -2220,7 +2281,10 @@ export default async function plugin(bb: BbPluginApi) {
           // are about to stop existing — stop it before wiping.
           for (const controller of jobControllers) controller.abort();
           jobControllers.clear();
-          generationBusy = false;
+          // Queued jobs reference pets that are about to be deleted — drop
+          // them before the wipe rather than letting pump() start one.
+          jobQueue.length = 0;
+          activeJob = false;
           currentJob = null;
           db.transaction(() => {
             db.prepare(`DELETE FROM xp_events`).run();
@@ -2256,6 +2320,17 @@ export default async function plugin(bb: BbPluginApi) {
       // settings change landed after teardown — the mirror is updated, done
     }
   });
+
+  // Boot announce. A `bb plugin reload` restarts this server but does NOT close
+  // the overlay's socket (it belongs to the host), so a reconnect-driven refetch
+  // never happens. This signal is the trigger that actually fires on reload.
+  if (!pluginDisposed) {
+    try {
+      bb.realtime.publish("pets", { kind: "server-boot", bundleStamp });
+    } catch {
+      // torn down between the check and the publish — nothing to announce to
+    }
+  }
 
   bb.log.info("pets backend ready");
 }

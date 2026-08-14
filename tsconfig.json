@@ -35,6 +35,7 @@
     "lib",
     "src",
     "overlay",
-    "panel"
+    "panel",
+    "test"
   ]
 }
