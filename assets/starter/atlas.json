@@ -1,0 +1,68 @@
+{
+  "version": 2,
+  "states": {
+    "think": {
+      "frames": 4,
+      "fps": 4,
+      "loop": true,
+      "width": 232,
+      "height": 64
+    },
+    "walk": {
+      "frames": 4,
+      "fps": 7,
+      "loop": true,
+      "width": 320,
+      "height": 64
+    },
+    "idle": {
+      "frames": 4,
+      "fps": 3,
+      "loop": true,
+      "width": 300,
+      "height": 64
+    },
+    "sad": {
+      "frames": 4,
+      "fps": 3,
+      "loop": false,
+      "width": 300,
+      "height": 64
+    },
+    "waiting": {
+      "frames": 4,
+      "fps": 3,
+      "loop": true,
+      "width": 280,
+      "height": 64
+    },
+    "celebrate": {
+      "frames": 4,
+      "fps": 6,
+      "loop": false,
+      "width": 276,
+      "height": 64
+    },
+    "wave": {
+      "frames": 4,
+      "fps": 5,
+      "loop": false,
+      "width": 328,
+      "height": 64
+    },
+    "sleep": {
+      "frames": 4,
+      "fps": 2,
+      "loop": true,
+      "width": 192,
+      "height": 64
+    },
+    "point": {
+      "frames": 4,
+      "fps": 4,
+      "loop": true,
+      "width": 312,
+      "height": 64
+    }
+  }
+}

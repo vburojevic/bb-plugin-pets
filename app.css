@@ -1,0 +1,329 @@
+/* bb-plugin-pets — overlay chrome. Colors come from host theme token
+   utilities in the JSX; this file owns positioning, animation, and pixel
+   rendering. */
+
+.pets-anchor {
+  will-change: transform;
+}
+
+.pets-body {
+  pointer-events: auto;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  transition: transform 0.16s ease-out, opacity 220ms ease;
+  transform-origin: 50% 100%;
+}
+
+.pets-body:active {
+  cursor: grabbing;
+}
+
+/* Courtesy fade: the composer below the pet has keyboard focus, so the pet
+   gets out of the way visually and stops eating clicks while it steps aside.
+   No keyframe touches opacity, so the transition above has nothing to fight. */
+.pets-ghost {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.pets-grabbed {
+  transform: scale(1.07, 0.95);
+  transition: transform 0.08s ease-out;
+}
+
+/* Quick squash pulses triggered imperatively from the loop. */
+.pets-turn {
+  animation: pets-turn-squash 0.16s ease-out;
+}
+
+@keyframes pets-turn-squash {
+  0% {
+    transform: scale(1, 1);
+  }
+  50% {
+    transform: scale(0.82, 1.06);
+  }
+  100% {
+    transform: scale(1, 1);
+  }
+}
+
+.pets-land {
+  animation: pets-land-squash 0.2s ease-out;
+}
+
+@keyframes pets-land-squash {
+  0% {
+    transform: scale(1.12, 0.78);
+  }
+  60% {
+    transform: scale(0.95, 1.06);
+  }
+  100% {
+    transform: scale(1, 1);
+  }
+}
+
+.pets-canvas {
+  display: block;
+  image-rendering: pixelated;
+  filter: drop-shadow(0 2px 2px rgb(0 0 0 / 0.25));
+  /* Declared here too so the peek eases back out as well as in. */
+  transition: transform 480ms ease;
+}
+
+/* Light themes wash the sprite's lower edge into the page; a hairline contact
+   shadow re-seats it without any theme detection (in dark themes it is all but
+   invisible). Scoped to the live pet only — the ceremony centrepiece and the
+   visitor canvas keep their own silhouettes. */
+.pets-body > .pets-canvas {
+  filter: drop-shadow(0 2px 2px rgb(0 0 0 / 0.25)) drop-shadow(0 1px 0 rgb(0 0 0 / 0.18));
+}
+
+/* Edge peek: the pet leans most of itself off the left edge. Applied to the
+   body, translating the CANVAS — the anchor carries an inline transform from
+   the paint loop and the body carries the squash/stretch keyframes, so the
+   canvas is the only layer with nothing to fight. */
+.pets-peek .pets-canvas {
+  transform: translateX(-58%);
+  transition: transform 480ms ease;
+}
+
+/* Static portrait in the context-menu header. */
+.pets-portrait {
+  display: block;
+  image-rendering: pixelated;
+}
+
+/* A den-mate strolling past along the bottom of the window. */
+.pets-visitor {
+  position: fixed;
+  bottom: 10px;
+  z-index: 37;
+  pointer-events: none;
+}
+
+.pets-ring {
+  position: fixed;
+  z-index: 37;
+  pointer-events: none;
+  border: 2px solid var(--primary, rgb(120 160 255));
+  border-radius: 8px;
+  box-shadow: 0 0 12px rgb(120 160 255 / 0.35);
+}
+
+/* High contrast: the attention ring is the one piece of overlay chrome that has
+   to survive being drawn over a busy sidebar, so it gets a thicker border and a
+   hard halo of the page background between it and whatever is underneath. The
+   ring renders as a sibling of the anchor (it is positioned against the window,
+   not the pet), hence the second selector — same rule, either nesting. */
+.pets-hc .pets-ring,
+.pets-ring.pets-hc {
+  border-width: 3px;
+  box-shadow: 0 0 0 2px var(--background, #000), 0 0 14px rgb(120 160 255 / 0.6);
+}
+
+/* Announced, never seen: the aria-live mirror of the speech bubble. */
+.pets-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.pets-evolving {
+  animation: pets-evolve-glow 0.9s ease-in-out 4;
+}
+
+@keyframes pets-evolve-glow {
+  0%,
+  100% {
+    filter: drop-shadow(0 2px 2px rgb(0 0 0 / 0.25));
+  }
+  50% {
+    filter: drop-shadow(0 0 14px rgb(255 220 120 / 0.9)) brightness(1.35);
+  }
+}
+
+/* --- evolution ceremony ---------------------------------------------------
+   The dim layer, the centrepiece and the card are all positioned inline (they
+   are one-off, and motion owns their transforms). Only the two pieces with
+   pixel-rendering or paint concerns live here. */
+
+.pets-ceremony-canvas {
+  display: block;
+  image-rendering: pixelated;
+  /* Duration is set inline so the reveal timing stays with the timeline. */
+  transition-property: filter;
+  transition-timing-function: ease-out;
+}
+
+/* The reveal flash: a soft bloom centred on the sprite, opacity animated by
+   motion. Sized off the centrepiece so it spills past the character's edges. */
+.pets-ceremony-flash {
+  position: absolute;
+  inset: -30%;
+  border-radius: 9999px;
+  pointer-events: none;
+  background: radial-gradient(circle, rgb(255 255 255 / 0.95) 0%, rgb(255 255 255 / 0) 70%);
+}
+
+.pets-bubble {
+  pointer-events: auto;
+  position: absolute;
+  bottom: calc(100% + 12px);
+  max-width: 240px;
+  width: max-content;
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.35;
+  padding: 6px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.pets-bubble-left {
+  left: 0;
+  border-bottom-left-radius: 2px;
+}
+
+.pets-bubble-right {
+  right: 0;
+  border-bottom-right-radius: 2px;
+}
+
+/* Speech tail, matching the card background and border. */
+.pets-bubble::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  width: 8px;
+  height: 8px;
+  background: inherit;
+  border-right: 1px solid var(--border, rgb(128 128 128 / 0.3));
+  border-bottom: 1px solid var(--border, rgb(128 128 128 / 0.3));
+  transform: translateY(-4.5px) rotate(45deg);
+}
+
+.pets-bubble-left::after {
+  left: 14px;
+}
+
+.pets-bubble-right::after {
+  right: 14px;
+}
+
+.pets-pip {
+  pointer-events: auto;
+  position: absolute;
+  bottom: calc(100% + 2px);
+  right: -6px;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 17px;
+  text-align: center;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.35);
+}
+
+/* Seasonal accent: a small mark tucked above the pet's head, tilted just
+   enough to look worn rather than pasted on. */
+.pets-seasonal {
+  pointer-events: none;
+  position: absolute;
+  bottom: calc(100% - 6px);
+  left: 15%;
+  font-size: 12px;
+  line-height: 1;
+  transform: rotate(-12deg);
+}
+
+.pets-particle {
+  position: absolute;
+  bottom: 65%;
+  left: 45%;
+  font-size: 14px;
+  pointer-events: none;
+}
+
+/* A dropped treat. Positioned against the window (not the anchor) and painted
+   by the loop, same translate convention as the sprite: left/bottom pin the
+   origin, the transform carries x and height. Clickable — tapping one tells the
+   pet which snack to go for. */
+.pets-treat {
+  position: fixed;
+  left: 0;
+  z-index: 36;
+  pointer-events: auto;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  user-select: none;
+  image-rendering: pixelated;
+  will-change: transform;
+  filter: drop-shadow(0 2px 2px rgb(0 0 0 / 0.3));
+}
+
+/* The fetch ball: a 10px pixel pellet, deliberately not a smooth circle — a
+   2px radius reads as "rounded sprite" at this size, where 50% reads as CSS. */
+.pets-ball {
+  position: fixed;
+  left: 0;
+  z-index: 37;
+  pointer-events: none;
+  box-sizing: border-box;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--primary, rgb(120 160 255));
+  border: 2px solid rgb(0 0 0 / 0.45);
+  image-rendering: pixelated;
+  will-change: transform;
+}
+
+.pets-mote {
+  position: absolute;
+  bottom: 80%;
+  left: 40px;
+  font-size: 11px;
+  font-weight: 600;
+  pointer-events: none;
+  animation: pets-float-up 1.5s ease-out forwards;
+}
+
+@keyframes pets-float-up {
+  from {
+    opacity: 0.95;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-34px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pets-mote,
+  .pets-turn,
+  .pets-land,
+  .pets-evolving {
+    animation: none;
+  }
+
+  /* The ceremony already drops to a card-only path in JS; this is the belt to
+     that braces, in case the canvas is ever rendered under reduced motion. */
+  .pets-ceremony-canvas {
+    transition: none;
+  }
+}
