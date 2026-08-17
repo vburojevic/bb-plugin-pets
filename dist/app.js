@@ -15287,6 +15287,8 @@ function Overlay({ pluginId }) {
   const composerFocusedRef = useRef(false);
   const composerRectsRef = useRef([]);
   const composerStampRef = useRef(0);
+  const focusedRectRef = useRef(null);
+  const focusedStampRef = useRef(0);
   const ghostRef = useRef(false);
   const ledgeSteppingRef = useRef(false);
   const ledgeClimbRef = useRef(false);
@@ -15554,6 +15556,15 @@ function Overlay({ pluginId }) {
       right: rect.right + 12,
       top: rect.top - 10
     }));
+  }, []);
+  const focusedComposer = useCallback(() => {
+    if (!composerFocusedRef.current) return null;
+    const now2 = performance.now();
+    if (now2 - focusedStampRef.current > COMPOSER_POLL_MS) {
+      focusedStampRef.current = now2;
+      focusedRectRef.current = focusedComposerRect();
+    }
+    return focusedRectRef.current;
   }, []);
   const bandAt = useCallback(
     (centerX) => {
@@ -16758,7 +16769,7 @@ function Overlay({ pluginId }) {
       } else if (!active) {
         speedRef.current = 0;
       }
-      const composer = composerFocusedRef.current ? focusedComposerRect() : null;
+      const composer = focusedComposer();
       const ghost = !!composer && pos.x + width >= composer.left - 8 && pos.x <= composer.right + 8 && // Still down at floor level, i.e. the ledge didn't lift it clear.
       pos.yBottom <= GROUND_PX + 2 && // The composer reaches down into the band the pet walks in.
       composer.bottom >= window.innerHeight - GROUND_PX - height * 1.2;
@@ -16850,6 +16861,7 @@ function Overlay({ pluginId }) {
     cancelFetch,
     celebrateTier,
     deriveState,
+    focusedComposer,
     hop,
     nudgeOffLedge,
     persistPrefs,

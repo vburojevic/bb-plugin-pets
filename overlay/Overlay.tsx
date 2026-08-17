@@ -866,6 +866,11 @@ export function Overlay({ pluginId }: { pluginId: string }) {
   // class only gets toggled on change.
   const composerRectsRef = useRef<DOMRect[]>([]);
   const composerStampRef = useRef(0);
+  // The FOCUSED composer's box, cached on the same cadence: a fresh
+  // getBoundingClientRect every tick forces a full-page layout whenever the
+  // DOM is being mutated (streaming tokens, navigations) — fatal on mobile.
+  const focusedRectRef = useRef<DOMRect | null>(null);
+  const focusedStampRef = useRef(0);
   const ghostRef = useRef(false);
   // --- terrain (the composer as a ledge) ---
   // True while the pet is mid-step between two ground elevations: deriveState
@@ -1216,6 +1221,21 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       right: rect.right + 12,
       top: rect.top - 10,
     }));
+  }, []);
+
+  /**
+   * The focused composer's box for the ghost check, on the same throttle as the
+   * band poll — a courtesy verdict tolerates the staleness, and the loop can't
+   * afford a forced layout every frame while the user is typing.
+   */
+  const focusedComposer = useCallback((): DOMRect | null => {
+    if (!composerFocusedRef.current) return null;
+    const now = performance.now();
+    if (now - focusedStampRef.current > COMPOSER_POLL_MS) {
+      focusedStampRef.current = now;
+      focusedRectRef.current = focusedComposerRect();
+    }
+    return focusedRectRef.current;
   }, []);
 
   /** The band a pet CENTRE x currently stands over, if any. */
@@ -2778,7 +2798,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       // this fires transiently (mid-step) or when measurement failed. Only the
       // input actually holding focus counts — with split panes the pet may be
       // standing over a different, idle composer entirely.
-      const composer = composerFocusedRef.current ? focusedComposerRect() : null;
+      const composer = focusedComposer();
       const ghost =
         !!composer &&
         pos.x + width >= composer.left - 8 &&
@@ -2910,6 +2930,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     cancelFetch,
     celebrateTier,
     deriveState,
+    focusedComposer,
     hop,
     nudgeOffLedge,
     persistPrefs,
