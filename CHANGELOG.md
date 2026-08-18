@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.1 — 2026-08-18
+
+### Fixed
+
+- **Git installs resolve `zod`**: moved `zod` from `devDependencies` to
+  `dependencies`. BB installs a git source with
+  `npm install --ignore-scripts --omit=dev` and then bundles `bb.server`
+  from `server.ts`, so a dev-only `zod` was never installed and the build
+  failed with `Could not resolve "zod"`. Local builds were unaffected,
+  which is why it survived to marketplace review
+  (get-bb/marketplace#7). Audited the rest of the runtime imports at the
+  same time; every other one is already a production dependency or a
+  host-provided external.
+
+### Changed
+
+- **Overlay**: the focused composer rect is cached instead of being
+  re-measured every frame, which stopped the overlay from forcing a
+  layout on each tick.
+
 ## 0.2.0 — 2026-08-14
 
 ### Added
