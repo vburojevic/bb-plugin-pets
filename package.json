@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-pets",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "license": "MIT",
   "author": "Vedran Burojevic",
@@ -42,7 +42,8 @@
     "pngjs": "^7.0.0",
     "sonner": "^2.0.8",
     "tailwind-merge": "^3.4.0",
-    "vaul": "^1.1.2"
+    "vaul": "^1.1.2",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
@@ -52,7 +53,6 @@
     "@types/react-dom": "^19.2.4",
     "better-sqlite3": "^12.0.0",
     "hono": "^4.11.9",
-    "typescript": "^5.7.0",
-    "zod": "^4.3.6"
+    "typescript": "^5.7.0"
   }
 }
