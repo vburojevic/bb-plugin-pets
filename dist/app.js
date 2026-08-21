@@ -23594,6 +23594,7 @@ function PetsPanel({ subPath }) {
 }
 
 // app.tsx
+var COMPACT_QUERY = "(max-width: 767px)";
 function PetsSettingsSection() {
   const rpc2 = useRpc();
   const navigate = useBbNavigate();
@@ -23615,17 +23616,47 @@ var app_default = definePluginApp((app) => {
   app.contentScripts.register({
     id: "pet-overlay",
     mount({ pluginId, signal }) {
-      const container = document.createElement("div");
-      container.setAttribute("data-bb-plugin-pets", "");
-      document.body.appendChild(container);
-      const root = createRoot(container);
-      root.render(/* @__PURE__ */ jsx(Overlay, { pluginId }));
+      const mql = window.matchMedia(COMPACT_QUERY);
+      let container = null;
+      let root = null;
       let disposed = false;
+      let decideToken = 0;
+      const mountOverlay = () => {
+        if (disposed || root) return;
+        container = document.createElement("div");
+        container.setAttribute("data-bb-plugin-pets", "");
+        document.body.appendChild(container);
+        root = createRoot(container);
+        root.render(/* @__PURE__ */ jsx(Overlay, { pluginId }));
+      };
+      const unmountOverlay = () => {
+        root?.unmount();
+        container?.remove();
+        root = null;
+        container = null;
+      };
+      const decide = () => {
+        const token = ++decideToken;
+        if (!mql.matches) {
+          mountOverlay();
+          return;
+        }
+        unmountOverlay();
+        void rpc(pluginId, "getOverlay").then((state) => {
+          if (disposed || token !== decideToken || !mql.matches) return;
+          if (state.settings.hideOnCompact === false) mountOverlay();
+        }).catch(() => {
+        });
+      };
+      const onBreakpointChange = () => decide();
+      mql.addEventListener("change", onBreakpointChange);
+      decide();
       const dispose = () => {
         if (disposed) return;
         disposed = true;
-        root.unmount();
-        container.remove();
+        decideToken += 1;
+        mql.removeEventListener("change", onBreakpointChange);
+        unmountOverlay();
       };
       signal.addEventListener("abort", dispose, { once: true });
       return dispose;
