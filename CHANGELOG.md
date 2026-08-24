@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.2 — 2026-08-24
+
+### Fixed
+
+- **Compact viewports never mount the overlay**: perf-watch traced phone
+  UI stalls to the overlay content script's rAF tick loop and per-tick
+  DOM scans; the render-time `hideOnCompact` check only blanked the pet
+  while every loop kept running. The content script now gates the React
+  root mount on `window.matchMedia("(max-width: 767px)")` — bb's compact
+  breakpoint — so phones never load the overlay at all, unless the
+  "Hide on small viewports" setting was explicitly turned off (checked
+  via the read-only `getOverlay` rpc, failing closed).
+
 ## 0.2.1 — 2026-08-18
 
 ### Fixed
