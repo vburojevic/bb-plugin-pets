@@ -1,7 +1,7 @@
 # BB Pet Parkour Design
 
 Date: 2026-08-28
-Status: approved in chat; awaiting written-spec review
+Status: approved
 
 ## Summary
 
