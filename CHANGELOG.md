@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 — 2026-08-28
+
+### Fixed
+
+- **Intermittent pink animation backgrounds**: Retro Diffusion can return a
+  mixed spritesheet where only some frame cells have a painted backdrop. The
+  cleanup pipeline now keys full and partial painted backgrounds per frame,
+  while requiring a substantial flat region before acting on a weaker
+  two-corner match so legitimate pet accents survive.
+
 ## 0.2.2 — 2026-08-24
 
 ### Fixed

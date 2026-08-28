@@ -17039,20 +17039,8 @@ function keyChromaMarker(png) {
   }
   return png;
 }
-function keySolidBackground(png, tolerance = 34) {
+function floodSolidBackground(png, ref, tolerance) {
   const { width: w, height: h, data } = png;
-  const cornerAt = (x, y) => {
-    const i = (w * y + x) * 4;
-    return { r: data[i], g: data[i + 1], b: data[i + 2], a: data[i + 3] };
-  };
-  const corners = [cornerAt(1, 1), cornerAt(w - 2, 1), cornerAt(1, h - 2), cornerAt(w - 2, h - 2)];
-  const opaque = corners.filter((c) => c.a > 200);
-  if (opaque.length < 3) return png;
-  const ref = opaque[0];
-  const agree = opaque.filter(
-    (c) => Math.abs(c.r - ref.r) + Math.abs(c.g - ref.g) + Math.abs(c.b - ref.b) < tolerance * 2
-  );
-  if (agree.length < 3) return png;
   const matches = (i) => {
     if (data[i * 4 + 3] === 0) return true;
     const dr = Math.abs(data[i * 4] - ref.r);
@@ -17088,6 +17076,22 @@ function keySolidBackground(png, tolerance = 34) {
   for (let i = 0; i < w * h; i++) {
     if (visited[i]) data[i * 4 + 3] = 0;
   }
+}
+function keySolidBackground(png, tolerance = 34) {
+  const { width: w, height: h, data } = png;
+  const cornerAt = (x, y) => {
+    const i = (w * y + x) * 4;
+    return { r: data[i], g: data[i + 1], b: data[i + 2], a: data[i + 3] };
+  };
+  const corners = [cornerAt(1, 1), cornerAt(w - 2, 1), cornerAt(1, h - 2), cornerAt(w - 2, h - 2)];
+  const opaque = corners.filter((c) => c.a > 200);
+  if (opaque.length < 3) return png;
+  const ref = opaque[0];
+  const agree = opaque.filter(
+    (c) => Math.abs(c.r - ref.r) + Math.abs(c.g - ref.g) + Math.abs(c.b - ref.b) < tolerance * 2
+  );
+  if (agree.length < 3) return png;
+  floodSolidBackground(png, ref, tolerance);
   const spread = Math.max(ref.r, ref.g, ref.b) - Math.min(ref.r, ref.g, ref.b);
   const channelsClose = Math.abs(ref.r - ref.g) < 40 && Math.abs(ref.g - ref.b) < 40 && Math.abs(ref.r - ref.b) < 40;
   if (spread < 30 && channelsClose) return png;
@@ -17098,6 +17102,50 @@ function keySolidBackground(png, tolerance = 34) {
     const dg = Math.abs(data[i * 4 + 1] - ref.g);
     const db = Math.abs(data[i * 4 + 2] - ref.b);
     if (dr + dg + db < strictThreshold) data[i * 4 + 3] = 0;
+  }
+  return png;
+}
+function keyPartialEdgeBackground(png, tolerance) {
+  const { width: w, height: h, data } = png;
+  const cornerAt = (x, y) => {
+    const i = (w * y + x) * 4;
+    return { r: data[i], g: data[i + 1], b: data[i + 2], a: data[i + 3] };
+  };
+  const corners = [cornerAt(1, 1), cornerAt(w - 2, 1), cornerAt(1, h - 2), cornerAt(w - 2, h - 2)];
+  const opaque = corners.filter((corner) => corner.a > 200);
+  if (opaque.length !== 2) return png;
+  const [ref, other] = opaque;
+  if (Math.abs(other.r - ref.r) + Math.abs(other.g - ref.g) + Math.abs(other.b - ref.b) >= tolerance * 2) {
+    return png;
+  }
+  let opaquePixels = 0;
+  let matchingPixels = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (data[i * 4 + 3] <= 200) continue;
+    opaquePixels++;
+    const distance = Math.abs(data[i * 4] - ref.r) + Math.abs(data[i * 4 + 1] - ref.g) + Math.abs(data[i * 4 + 2] - ref.b);
+    if (distance < tolerance * 3) matchingPixels++;
+  }
+  if (matchingPixels < w * h * 0.08 || matchingPixels < opaquePixels * 0.35) return png;
+  floodSolidBackground(png, ref, tolerance);
+  return png;
+}
+function keySolidBackgroundCells(png, cellWidth, cellHeight, tolerance = 34) {
+  if (!Number.isInteger(cellWidth) || cellWidth < 3 || !Number.isInteger(cellHeight) || cellHeight < 3) {
+    return png;
+  }
+  const columns = Math.floor(png.width / cellWidth);
+  const rows = Math.floor(png.height / cellHeight);
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      const cell = new import_pngjs.PNG({ width: cellWidth, height: cellHeight });
+      const x = column * cellWidth;
+      const y = row * cellHeight;
+      import_pngjs.PNG.bitblt(png, cell, x, y, cellWidth, cellHeight, 0, 0);
+      keySolidBackground(cell, tolerance);
+      keyPartialEdgeBackground(cell, tolerance);
+      import_pngjs.PNG.bitblt(cell, png, 0, 0, cellWidth, cellHeight, x, y);
+    }
   }
   return png;
 }
@@ -17794,7 +17842,9 @@ async function rdGenerateStrips(rd, hero, onProgress, signal, states, sideHero) 
             signal
           );
           const normalized = sheetToStrip(
-            keyChromaMarker(keySolidBackground(sheet)),
+            keyChromaMarker(
+              keySolidBackgroundCells(keySolidBackground(sheet), RD_FRAME, RD_FRAME)
+            ),
             RD_FRAME,
             RD_FRAME
           );

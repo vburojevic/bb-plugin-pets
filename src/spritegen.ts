@@ -19,6 +19,7 @@ import {
   keyChromaMarker,
   keyMagenta,
   keySolidBackground,
+  keySolidBackgroundCells,
   pixelateSingle,
   pixelateStrip,
 } from "./quantize.ts";
@@ -919,11 +920,15 @@ async function rdGenerateStrips(
             signal,
           );
           // RD occasionally paints a solid background even for transparent
-          // input (killed a live job: "idle: background looks painted").
+          // input. Clean the sheet first, then each frame independently: a
+          // mixed sheet can have transparent early frames and painted later
+          // frames, which prevents a whole-sheet corner consensus.
           // RD sometimes emits stray pure-magenta transparency-marker pixels inside the
           // character; key exactly those (tight band, unlike gpt's loose backdrop key).
           const normalized = sheetToStrip(
-            keyChromaMarker(keySolidBackground(sheet)),
+            keyChromaMarker(
+              keySolidBackgroundCells(keySolidBackground(sheet), RD_FRAME, RD_FRAME),
+            ),
             RD_FRAME,
             RD_FRAME,
           );

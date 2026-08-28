@@ -357,6 +357,47 @@ export function keyChromaMarker(png: PNG): PNG {
   return png;
 }
 
+type BackgroundColor = { r: number; g: number; b: number; a: number };
+
+function floodSolidBackground(png: PNG, ref: BackgroundColor, tolerance: number): void {
+  const { width: w, height: h, data } = png;
+  const matches = (i: number) => {
+    if (data[i * 4 + 3]! === 0) return true;
+    const dr = Math.abs(data[i * 4]! - ref.r);
+    const dg = Math.abs(data[i * 4 + 1]! - ref.g);
+    const db = Math.abs(data[i * 4 + 2]! - ref.b);
+    return dr + dg + db < tolerance * 3;
+  };
+  const visited = new Uint8Array(w * h);
+  const stack: number[] = [];
+  const push = (x: number, y: number) => {
+    const i = y * w + x;
+    if (visited[i] || !matches(i)) return;
+    visited[i] = 1;
+    stack.push(i);
+  };
+  for (let x = 0; x < w; x++) {
+    push(x, 0);
+    push(x, h - 1);
+  }
+  for (let y = 0; y < h; y++) {
+    push(0, y);
+    push(w - 1, y);
+  }
+  while (stack.length > 0) {
+    const i = stack.pop()!;
+    const x = i % w;
+    const y = (i - x) / w;
+    if (x > 0) push(x - 1, y);
+    if (x < w - 1) push(x + 1, y);
+    if (y > 0) push(x, y - 1);
+    if (y < h - 1) push(x, y + 1);
+  }
+  for (let i = 0; i < w * h; i++) {
+    if (visited[i]) data[i * 4 + 3] = 0;
+  }
+}
+
 /**
  * Key out a SOLID painted background (Retro Diffusion sometimes fills one in
  * even for transparent input): if at least three corners agree on an opaque
@@ -397,41 +438,7 @@ export function keySolidBackground(png: PNG, tolerance = 34): PNG {
   );
   if (agree.length < 3) return png;
 
-  const matches = (i: number) => {
-    if (data[i * 4 + 3]! === 0) return true; // already clear — traversable
-    const dr = Math.abs(data[i * 4]! - ref.r);
-    const dg = Math.abs(data[i * 4 + 1]! - ref.g);
-    const db = Math.abs(data[i * 4 + 2]! - ref.b);
-    return dr + dg + db < tolerance * 3;
-  };
-  const visited = new Uint8Array(w * h);
-  const stack: number[] = [];
-  const push = (x: number, y: number) => {
-    const i = y * w + x;
-    if (visited[i] || !matches(i)) return;
-    visited[i] = 1;
-    stack.push(i);
-  };
-  for (let x = 0; x < w; x++) {
-    push(x, 0);
-    push(x, h - 1);
-  }
-  for (let y = 0; y < h; y++) {
-    push(0, y);
-    push(w - 1, y);
-  }
-  while (stack.length > 0) {
-    const i = stack.pop()!;
-    const x = i % w;
-    const y = (i - x) / w;
-    if (x > 0) push(x - 1, y);
-    if (x < w - 1) push(x + 1, y);
-    if (y > 0) push(x, y - 1);
-    if (y < h - 1) push(x, y + 1);
-  }
-  for (let i = 0; i < w * h; i++) {
-    if (visited[i]) data[i * 4 + 3] = 0;
-  }
+  floodSolidBackground(png, ref, tolerance);
 
   // Pass 2: kill enclosed background pockets the border flood could not reach.
   const spread = Math.max(ref.r, ref.g, ref.b) - Math.min(ref.r, ref.g, ref.b);
@@ -446,6 +453,82 @@ export function keySolidBackground(png: PNG, tolerance = 34): PNG {
     const dg = Math.abs(data[i * 4 + 1]! - ref.g);
     const db = Math.abs(data[i * 4 + 2]! - ref.b);
     if (dr + dg + db < strictThreshold) data[i * 4 + 3] = 0;
+  }
+  return png;
+}
+
+/**
+ * A frame can be only partly painted, leaving two corners transparent and two
+ * same-colour corners opaque. This narrower fallback clears only the
+ * border-connected paint; it deliberately skips the unconstrained pocket pass
+ * used by the stronger three-corner consensus.
+ */
+function keyPartialEdgeBackground(png: PNG, tolerance: number): PNG {
+  const { width: w, height: h, data } = png;
+  const cornerAt = (x: number, y: number): BackgroundColor => {
+    const i = (w * y + x) * 4;
+    return { r: data[i]!, g: data[i + 1]!, b: data[i + 2]!, a: data[i + 3]! };
+  };
+  const corners = [cornerAt(1, 1), cornerAt(w - 2, 1), cornerAt(1, h - 2), cornerAt(w - 2, h - 2)];
+  const opaque = corners.filter((corner) => corner.a > 200);
+  if (opaque.length !== 2) return png;
+  const [ref, other] = opaque as [BackgroundColor, BackgroundColor];
+  if (Math.abs(other.r - ref.r) + Math.abs(other.g - ref.g) + Math.abs(other.b - ref.b) >= tolerance * 2) {
+    return png;
+  }
+  let opaquePixels = 0;
+  let matchingPixels = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (data[i * 4 + 3]! <= 200) continue;
+    opaquePixels++;
+    const distance =
+      Math.abs(data[i * 4]! - ref.r) +
+      Math.abs(data[i * 4 + 1]! - ref.g) +
+      Math.abs(data[i * 4 + 2]! - ref.b);
+    if (distance < tolerance * 3) matchingPixels++;
+  }
+  // Two matching edge pixels can be a legitimate wide character. Require a
+  // genuinely large, flat region before treating the weaker consensus as a
+  // painted backdrop.
+  if (matchingPixels < w * h * 0.08 || matchingPixels < opaquePixels * 0.35) return png;
+  floodSolidBackground(png, ref, tolerance);
+  return png;
+}
+
+/**
+ * Apply solid-background removal independently to every complete frame cell.
+ *
+ * Retro Diffusion may return a mixed sheet where only some animation frames
+ * have a painted backdrop. Looking at the four corners of the whole sheet then
+ * sees transparent frames on one side and painted frames on the other, so the
+ * sheet-level consensus deliberately no-ops. Each affected cell still has a
+ * valid full or partial edge consensus, however, and can be keyed safely in
+ * isolation.
+ *
+ * Mutates `png` in place and returns it. Partial cells at the right/bottom edge
+ * are left untouched because they are not animation frames.
+ */
+export function keySolidBackgroundCells(
+  png: PNG,
+  cellWidth: number,
+  cellHeight: number,
+  tolerance = 34,
+): PNG {
+  if (!Number.isInteger(cellWidth) || cellWidth < 3 || !Number.isInteger(cellHeight) || cellHeight < 3) {
+    return png;
+  }
+  const columns = Math.floor(png.width / cellWidth);
+  const rows = Math.floor(png.height / cellHeight);
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      const cell = new PNG({ width: cellWidth, height: cellHeight });
+      const x = column * cellWidth;
+      const y = row * cellHeight;
+      PNG.bitblt(png, cell, x, y, cellWidth, cellHeight, 0, 0);
+      keySolidBackground(cell, tolerance);
+      keyPartialEdgeBackground(cell, tolerance);
+      PNG.bitblt(cell, png, 0, 0, cellWidth, cellHeight, x, y);
+    }
   }
   return png;
 }

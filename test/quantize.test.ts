@@ -6,6 +6,7 @@ import { PNG } from "pngjs";
 import {
   keyChromaMarker,
   keySolidBackground,
+  keySolidBackgroundCells,
   nearestResize,
   quantizePalette,
 } from "../src/quantize.ts";
@@ -158,6 +159,56 @@ describe("keySolidBackground", () => {
     const out = keySolidBackground(png);
     assert.equal(alphaAt(out, 0, 0), 0);
     assert.equal(alphaAt(out, 5, 5), 255);
+  });
+});
+
+describe("keySolidBackgroundCells", () => {
+  const BG: RGBA = [233, 130, 217, 255];
+  const CHAR: RGBA = [20, 180, 30, 255];
+
+  it("cleans painted cells in a mixed strip whose whole-sheet corners disagree", () => {
+    const png = makePng(32, 16, [0, 0, 0, 0]);
+    fillRect(png, 4, 4, 11, 14, CHAR);
+    fillRect(png, 16, 0, 31, 15, BG);
+    fillRect(png, 20, 4, 27, 14, CHAR);
+
+    keySolidBackground(png);
+    assert.equal(alphaAt(png, 17, 1), 255, "whole-sheet consensus must not trigger");
+
+    keySolidBackgroundCells(png, 16, 16);
+    assert.equal(alphaAt(png, 17, 1), 0, "painted frame background is cleared");
+    assert.deepEqual(getPx(png, 21, 5), CHAR, "character in the painted frame survives");
+    assert.deepEqual(getPx(png, 5, 5), CHAR, "already-transparent frame survives");
+  });
+
+  it("leaves incomplete edge cells untouched", () => {
+    const png = makePng(18, 16, BG);
+    keySolidBackgroundCells(png, 16, 16);
+    assert.equal(alphaAt(png, 1, 1), 0);
+    assert.deepEqual(getPx(png, 17, 1), BG);
+  });
+
+  it("cleans a partially painted cell with two matching opaque edge corners", () => {
+    const png = makePng(16, 16, [0, 0, 0, 0]);
+    fillRect(png, 8, 0, 15, 15, BG);
+    fillRect(png, 6, 4, 11, 14, CHAR);
+
+    keySolidBackgroundCells(png, 16, 16);
+    assert.equal(alphaAt(png, 14, 1), 0, "top-right paint is cleared");
+    assert.equal(alphaAt(png, 14, 14), 0, "bottom-right paint is cleared");
+    assert.deepEqual(getPx(png, 9, 5), CHAR, "character overlapping the painted area survives");
+  });
+
+  it("does not mistake two small same-colour corner accents for a backdrop", () => {
+    const png = makePng(16, 16, [0, 0, 0, 0]);
+    fillRect(png, 5, 4, 10, 13, CHAR);
+    setPx(png, 14, 1, BG);
+    setPx(png, 14, 14, BG);
+
+    keySolidBackgroundCells(png, 16, 16);
+    assert.deepEqual(getPx(png, 14, 1), BG);
+    assert.deepEqual(getPx(png, 14, 14), BG);
+    assert.deepEqual(getPx(png, 6, 5), CHAR);
   });
 });
 
