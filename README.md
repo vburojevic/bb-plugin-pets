@@ -153,3 +153,10 @@ npm install
 bb plugin dev        # watch: rebuild app bundle + reload on save
 npx tsc --noEmit     # typecheck
 ```
+
+---
+
+## More bb plugins
+
+This is one of eight bb plugins I publish — see them all at
+[**vburojevic/bb-plugins**](https://github.com/vburojevic/bb-plugins).
