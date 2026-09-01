@@ -158,5 +158,5 @@ npx tsc --noEmit     # typecheck
 
 ## More bb plugins
 
-This is one of eight bb plugins I publish — see them all at
+See every bb plugin I publish at
 [**vburojevic/bb-plugins**](https://github.com/vburojevic/bb-plugins).
