@@ -9,7 +9,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import NumberFlow from "@number-flow/react";
 import { AnimatePresence, motion } from "motion/react";
 import { toast } from "sonner";
-import { useBbNavigate, useRealtime, useRpc } from "@bb/plugin-sdk/app";
+import { useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../server";
 import type { RpcOutput } from "../overlay/net";
 import { resolveState, type SpriteState } from "../src/atlas";

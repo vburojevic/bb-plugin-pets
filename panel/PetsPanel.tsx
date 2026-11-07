@@ -9,7 +9,7 @@ import {
   useRealtime,
   useRpc,
   type PluginNavPanelProps,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../server";
 import { Habitat } from "./Habitat";
 import type { RpcOutput } from "../overlay/net";

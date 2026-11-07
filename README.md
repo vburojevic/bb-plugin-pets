@@ -21,7 +21,7 @@ keys, no setup. Add an OpenAI API key (and optionally a Retro Diffusion key) in
 the plugin's settings to hatch your own; the hatchery spells out what each key
 unlocks.
 
-Requires bb >= 0.37.
+Requires bb >= 0.49.
 
 Keys can also be set from the CLI:
 `bb plugin config pets set openaiApiKey sk-…`.

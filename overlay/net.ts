@@ -8,7 +8,7 @@
 import type {
   StandardSchemaV1InferInput,
   StandardSchemaV1InferOutput,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../server";
 
 type Contract = typeof rpcContract;
