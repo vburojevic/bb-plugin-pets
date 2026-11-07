@@ -12,8 +12,24 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 
-// Supplied by the bb host at runtime, never bundled from node_modules.
-const HOST_PROVIDED = new Set(["@bb/plugin-sdk", "react", "react-dom"]);
+// Supplied by the bb host at runtime, never bundled from node_modules. The
+// frontend packages below are runtime-shimmed by bb (dist/app.meta.json lists
+// them as runtimeSlots), so `bb plugin types` pins them as type-only
+// devDependencies.
+const HOST_PROVIDED = new Set([
+  "@get-bb/plugin-sdk",
+  "react",
+  "react-dom",
+  "@radix-ui/react-alert-dialog",
+  "@radix-ui/react-context-menu",
+  "@radix-ui/react-popover",
+  "@radix-ui/react-tooltip",
+  "class-variance-authority",
+  "clsx",
+  "sonner",
+  "tailwind-merge",
+  "vaul",
+]);
 
 const STATIC_IMPORT = /(?:^|[\s;])(?:import|export)\s+(type\s+)?(?:[^'";]*?\sfrom\s*)?["']([^"']+)["']/g;
 const DYNAMIC_IMPORT = /\bimport\(\s*["']([^"']+)["']\s*\)/g;
