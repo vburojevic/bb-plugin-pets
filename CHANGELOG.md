@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 — 2026-11-07
+
+### Fixed
+
+- **The pet no longer floats under a top composer**: on the new-thread page the pet hovered in mid-air under the composer. A composer entirely out of the pet's reach is no longer a ledge, and composers are re-measured after a window resize. (#7)
+
 ## 0.3.0 — 2026-11-07
 
 Requires bb 0.49 or later. bb installs from git skip tags whose engines don't match, so older bb stays on 0.2.4.
