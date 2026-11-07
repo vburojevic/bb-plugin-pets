@@ -118,11 +118,12 @@ Four tabs in the sidebar — the pet's home, its paperwork, and its birthplace.
 
 ## Architecture notes
 
-- The overlay is a **content script with its own React root** and a
-  hook-free data plane: SDK app hooks require host slot context, so it uses
-  plain `fetch` for rpc, its own WebSocket to `/ws` for realtime signals,
-  and the Navigation API for route watching. `react-dom/client` is shimmed
-  to the host, so rendering stays on the host's React.
+- The overlay is an **app-wide overlay slot**
+  (`app.slots.experimental_appOverlay`), so it reads through the same SDK
+  hooks as every other surface: `useRpc` for calls, `useRealtime` for the
+  `pets` channel, `useBbContext` for the thread in view, and `useBbNavigate`
+  to open threads and panels. Below bb's compact breakpoint it renders
+  nothing, so none of its loops run on phones.
 - Sprites render on a **canvas** (integer source rects, smoothing off) —
   CSS background-position sprites bleed adjacent frames at fractional sizes.
 - **Fleet state lives server-side** (lifecycle events + `thread:changed`

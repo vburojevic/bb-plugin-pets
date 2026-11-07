@@ -1,4 +1,5 @@
-// The floating companion. Hook-free data plane (see net.ts); React renders
+// The floating companion, mounted app-wide through experimental_appOverlay.
+// Data comes through SDK hooks (see net.ts); React renders
 // structure while one rAF loop drives locomotion, physics, and frame stepping
 // through refs. Sprites draw onto a canvas — pixel-exact source rects, so
 // adjacent frames can never bleed (CSS background-position sprites leak at
@@ -24,13 +25,15 @@ import {
 import { resolveState, type SpriteState } from "../src/atlas";
 import { EMOTION_LABELS, charGeometry, nextFrame, randomBetween } from "./core";
 import {
-  connectSignals,
-  currentThreadId,
-  navigateToThread,
-  rpc,
-  watchRoute,
-  type RpcOutput,
-} from "./net";
+  experimental_usePluginId,
+  useBbContext,
+  useBbNavigate,
+  useRealtime,
+  useRealtimeConnectionState,
+  useRpc,
+} from "@get-bb/plugin-sdk/app";
+import type { rpcContract } from "../server";
+import { rpc, type PetsRpc, type RpcOutput } from "./net";
 import { pickLine, type AmbientContext } from "./personality";
 import { setSoundVolume, setSoundsEnabled, setVoiceSeed, sounds, unlockSounds } from "./sounds";
 
@@ -315,7 +318,7 @@ function readAmbient(payload: unknown): AmbientContext {
 // The ambient-context method is added by the server half of this feature; call
 // it through a loose signature so this file compiles either way.
 const looseRpc = rpc as unknown as (
-  pluginId: string,
+  client: PetsRpc,
   method: string,
   input?: unknown,
 ) => Promise<unknown>;
@@ -708,10 +711,13 @@ function EvolutionCeremony({
   );
 }
 
-export function Overlay({ pluginId }: { pluginId: string }) {
+export function Overlay() {
+  const api = useRpc<typeof rpcContract>();
+  const pluginId = experimental_usePluginId();
+  const navigate = useBbNavigate();
+  const { threadId: viewedThreadId } = useBbContext();
   const [data, setData] = useState<OverlayData | null>(null);
   const [fleet, setFleet] = useState<Fleet | null>(null);
-  const [viewedThreadId, setViewedThreadId] = useState<string | null>(currentThreadId());
   const [spriteState, setSpriteState] = useState<SpriteState>("wave");
   const [bubble, setBubble] = useState<BubbleState | null>(null);
   // Measured placement for the live bubble: which side its tail hangs off, and
@@ -1059,13 +1065,52 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     momentRef.current = { state: "love", until: Date.now() + 1400 };
     hop(210);
     sounds.pet();
-    void rpc(pluginId, "petPet", { petId: pet.id }).catch(() => {});
-  }, [burstHearts, hop, pluginId]);
+    void rpc(api, "petPet", { petId: pet.id }).catch(() => {});
+  }, [burstHearts, hop, api]);
 
+  // bb's navigation API has no settings route, so the Settings item still
+  // pushes the path itself. Everything else goes through useBbNavigate.
   const navigateTo = useCallback((path: string) => {
     history.pushState({}, "", path);
     window.dispatchEvent(new PopStateEvent("popstate"));
   }, []);
+
+  // Stable across renders, so the many callbacks that open a thread never need
+  // it in their dependency lists.
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
+  const openThread = useCallback((threadId: string) => {
+    navigateRef.current.toThread(threadId);
+  }, []);
+
+  // Realtime: useRealtime keeps one subscription to the "pets" channel for the
+  // overlay's lifetime; the data-wiring effect below installs the handler.
+  // After a dropped connection comes back, durable state is refetched.
+  const signalHandlerRef = useRef<((payload: unknown) => void) | null>(null);
+  const reconnectRef = useRef<(() => void) | null>(null);
+  useRealtime("pets", (payload) => signalHandlerRef.current?.(payload));
+  const connection = useRealtimeConnectionState();
+  const lastConnectionRef = useRef(connection);
+  useEffect(() => {
+    const previous = lastConnectionRef.current;
+    lastConnectionRef.current = connection;
+    if (connection === "connected" && previous === "reconnecting") reconnectRef.current?.();
+  }, [connection]);
+  const subscribeSignals = useCallback(
+    (options: { signal: AbortSignal; onReconnect: () => void; onSignal: (payload: unknown) => void }) => {
+      signalHandlerRef.current = options.onSignal;
+      reconnectRef.current = options.onReconnect;
+      options.signal.addEventListener(
+        "abort",
+        () => {
+          if (signalHandlerRef.current === options.onSignal) signalHandlerRef.current = null;
+          if (reconnectRef.current === options.onReconnect) reconnectRef.current = null;
+        },
+        { once: true },
+      );
+    },
+    [],
+  );
 
   // Staleness handshake. The stamp is added by the server half of this
   // feature, so it is read through a widened view (same idiom as
@@ -1089,7 +1134,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
   );
 
   const refetch = useCallback(() => {
-    return rpc(pluginId, "getOverlay").then((next) => {
+    return rpc(api, "getOverlay").then((next) => {
       setData(next);
       setFleet(next.fleet);
       setSoundsEnabled(next.settings.sounds);
@@ -1111,7 +1156,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       // reads the new stage off it) don't have to race the state update.
       return next;
     });
-  }, [pluginId, checkBundleStamp]);
+  }, [api, checkBundleStamp]);
 
   const refetchQuiet = useCallback(() => {
     void refetch().catch(() => {});
@@ -1119,14 +1164,14 @@ export function Overlay({ pluginId }: { pluginId: string }) {
 
   const persistPrefs = useCallback(() => {
     const pos = posRef.current;
-    void rpc(pluginId, "setOverlayPrefs", {
+    void rpc(api, "setOverlayPrefs", {
       x: pos.x === null ? null : Math.min(1, Math.max(0, pos.x / window.innerWidth)),
       y: pos.parked ? Math.round(pos.yBottom) : null,
       // Sizing is per-pet now (pet.sizeScale); the global scale is vestigial.
       scale: 1,
       parked: pos.parked,
     }).catch(() => {});
-  }, [pluginId]);
+  }, [api]);
 
   const startMission = useCallback(
     (thread: FleetThreadView) => {
@@ -1160,7 +1205,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
   );
 
   const pointAtAttention = useCallback(() => {
-    void rpc(pluginId, "getAttentionThreads")
+    void rpc(api, "getAttentionThreads")
       .then(({ threads }) => {
         const target = threads[0];
         // Manual pointing ignores the memory, but still stamps it: an explicit
@@ -1172,17 +1217,17 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         else showBubble("Nothing needs you. Enjoy it while it lasts.", { important: true });
       })
       .catch(() => {});
-  }, [pluginId, showBubble, startMission]);
+  }, [api, showBubble, startMission]);
 
   const fetchLatestFailure = useCallback(() => {
-    void rpc(pluginId, "getAttentionThreads")
+    void rpc(api, "getAttentionThreads")
       .then(({ threads }) => {
         const failed = threads.find((thread) => thread.status === "failed");
-        if (failed) navigateToThread(failed.projectId, failed.id);
+        if (failed) openThread(failed.id);
         else showBubble("No failures. Frame this moment.", { important: true });
       })
       .catch(() => {});
-  }, [pluginId, showBubble]);
+  }, [api, showBubble]);
 
   // Optimistic locally, debounced to the server — shared by the wheel gesture
   // and the menu's size row so both agree on clamping and write cadence.
@@ -1197,10 +1242,10 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       if (sizeSaveRef.current) clearTimeout(sizeSaveRef.current);
       sizeSaveRef.current = setTimeout(() => {
         sizeSaveRef.current = null;
-        void rpc(pluginId, "setPetSize", { petId, scale: next }).catch(() => {});
+        void rpc(api, "setPetSize", { petId, scale: next }).catch(() => {});
       }, 400);
     },
-    [pluginId],
+    [api],
   );
 
   /**
@@ -1615,10 +1660,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         if (!controller.signal.aborted) refetchQuiet();
       }, 1500);
     });
-    watchRoute((threadId) => setViewedThreadId(threadId), controller.signal);
-    connectSignals({
-      pluginId,
-      channel: "pets",
+    subscribeSignals({
       signal: controller.signal,
       onReconnect: refetchQuiet,
       onSignal: (payload) => {
@@ -1827,10 +1869,10 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     checkLongRunners,
     dropTreatAt,
     hop,
-    pluginId,
     refetch,
     refetchQuiet,
     showBubble,
+    subscribeSignals,
   ]);
 
   // Ceremony preview (dev only — the dev card's button dispatches it). Replays
@@ -1994,7 +2036,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         schedule();
         return;
       }
-      void rpc(pluginId, "listDen")
+      void rpc(api, "listDen")
         .then((result) => {
           if (cancelled) return;
           const others = result.pets.filter((entry) => !entry.active);
@@ -2014,7 +2056,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [pluginId, reducedMotion]);
+  }, [api, reducedMotion]);
 
   // Bubble expiry.
   useEffect(() => {
@@ -2517,7 +2559,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
             sounds.pet();
             buffUntilRef.current = playNow + TREAT_BUFF_MS;
             nextBuffSparkleRef.current = playNow;
-            void looseRpc(pluginId, "eatTreat").catch(() => {});
+            void looseRpc(api, "eatTreat").catch(() => {});
             syncTreats();
             logDebug("treat", "eaten");
           } else {
@@ -2617,7 +2659,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
           ball.yBottom = terrainAt(pos.x + width / 2);
           fetchActiveRef.current = false;
           celebrateTier("minor");
-          void looseRpc(pluginId, "recordFetch").catch(() => {});
+          void looseRpc(api, "recordFetch").catch(() => {});
           if (Math.random() < 0.3) showBubble("again.");
           // Hand the LIVE position to React alongside the fade, so the re-render
           // can't snap the ball back to where it was thrown from.
@@ -2935,7 +2977,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     nudgeOffLedge,
     persistPrefs,
     playTimeout,
-    pluginId,
+    api,
     pulseClass,
     reducedMotion,
     showBubble,
@@ -3145,7 +3187,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       if (flavors.length === 0) return;
       let ctx: AmbientContext;
       try {
-        ctx = readAmbient(await looseRpc(pluginId, "getAmbientContext"));
+        ctx = readAmbient(await looseRpc(api, "getAmbientContext"));
       } catch {
         return;
       }
@@ -3403,7 +3445,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     data?.pet?.id,
     data?.settings.enabled,
     burstSparkles,
-    pluginId,
+    api,
     pulseClass,
     reducedMotion,
     showBubble,
@@ -3470,9 +3512,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         ?.closest("[data-sidebar-thread-id]");
       const droppedThreadId = row?.getAttribute("data-sidebar-thread-id");
       if (droppedThreadId) {
-        const thread = fleetRef.current?.threads.find((t) => t.id === droppedThreadId);
-        if (thread) navigateToThread(thread.projectId, thread.id);
-        else navigateTo(`/threads/${droppedThreadId}`);
+        openThread(droppedThreadId);
         momentRef.current = { state: "celebrate", until: Date.now() + 1400 };
         sounds.pet();
         pos.parked = false;
@@ -3529,7 +3569,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         missionRef.current = null;
         lastHighlightRectRef.current = null;
         setHighlight(null);
-        navigateToThread(pointing.thread.projectId, pointing.thread.id);
+        openThread(pointing.thread.id);
         return;
       }
       petThePet();
@@ -3552,9 +3592,9 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
     }
-    void rpc(pluginId, "getNeediestThread")
+    void rpc(api, "getNeediestThread")
       .then(({ thread }) => {
-        if (thread) navigateToThread(thread.projectId, thread.id);
+        if (thread) openThread(thread.id);
         else showBubble("Nothing needs you. Suspicious.", { important: true });
       })
       .catch(() => {});
@@ -3662,7 +3702,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
               style={bubbleFit ? { left: bubbleFit.left, right: "auto" } : undefined}
               onClick={() => {
                 if (bubble.threadId && bubble.projectId) {
-                  navigateToThread(bubble.projectId, bubble.threadId);
+                  openThread(bubble.threadId);
                 }
                 setBubble(null);
               }}
@@ -3780,12 +3820,12 @@ export function Overlay({ pluginId }: { pluginId: string }) {
               }
               dragRef.current = null;
               setGrabbed(false);
-              void rpc(pluginId, "listDen")
+              void rpc(api, "listDen")
                 .then((result) => setDen(result.pets))
                 .catch(() => {});
               // Treat wallet, loaded alongside the den. Silent on failure: the
               // server half may not be there yet, and the menu still works.
-              void looseRpc(pluginId, "getTreats")
+              void looseRpc(api, "getTreats")
                 .then((result) => {
                   const balance = (result as { balance?: unknown } | null)?.balance;
                   if (typeof balance === "number") setTreatBalance(balance);
@@ -3899,7 +3939,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
                 // The drop itself is driven by the server's treat-drop signal;
                 // this only spends the treat.
                 setTreatBalance((prev) => Math.max(0, prev - 1));
-                void looseRpc(pluginId, "dropTreat")
+                void looseRpc(api, "dropTreat")
                   .then((result) => {
                     const balance = (result as { balance?: unknown } | null)?.balance;
                     if (typeof balance === "number") setTreatBalance(balance);
@@ -3932,7 +3972,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
                     <ContextMenuItem
                       key={entry.id}
                       disabled={entry.active}
-                      onSelect={guardedSelect(() => void rpc(pluginId, "selectPet", { petId: entry.id }).catch(() => {}))}
+                      onSelect={guardedSelect(() => void rpc(api, "selectPet", { petId: entry.id }).catch(() => {}))}
                     >
                       {entry.active ? "→ " : ""}
                       {entry.name} · {entry.stage.name}
@@ -3941,13 +3981,13 @@ export function Overlay({ pluginId }: { pluginId: string }) {
                 </ContextMenuSubContent>
               </ContextMenuSub>
             ) : null}
-            <ContextMenuItem onSelect={guardedSelect(() => navigateTo(`/plugins/${pluginId}/pets/hatchery`))}>
+            <ContextMenuItem onSelect={guardedSelect(() => navigate.toPluginPanel("pets", { subPath: "hatchery" }))}>
               Hatch a new pet…
             </ContextMenuItem>
             {pet.artBehind && data.hasApiKey ? (
               <ContextMenuItem
                 onSelect={guardedSelect(() => {
-                  void rpc(pluginId, "evolveArt", { petId: pet.id })
+                  void rpc(api, "evolveArt", { petId: pet.id })
                     .then(() => showBubble("New look incoming…", { important: true }))
                     .catch((error: Error) => showBubble(error.message, { important: true }));
                 })}
@@ -3983,7 +4023,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
             <ContextMenuItem onSelect={guardedSelect(() => setSessionHidden(true))}>Hide until reload</ContextMenuItem>
             <ContextMenuSeparator />
             <ContextMenuItem onSelect={guardedSelect(startTour)}>Show me around</ContextMenuItem>
-            <ContextMenuItem onSelect={guardedSelect(() => navigateTo(`/plugins/${pluginId}/pets`))}>
+            <ContextMenuItem onSelect={guardedSelect(() => navigate.toPluginPanel("pets"))}>
               Open Pets panel
             </ContextMenuItem>
             <ContextMenuItem onSelect={guardedSelect(() => navigateTo(`/settings/plugins/${pluginId}`))}>

@@ -19,7 +19,6 @@
     "radixTooltip",
     "react",
     "reactDom",
-    "reactDomClient",
     "sonner",
     "tailwindMerge",
     "vaul"

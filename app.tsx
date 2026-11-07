@@ -1,16 +1,16 @@
 // bb-plugin-pets — frontend entry.
 //
-// Surfaces: the floating companion overlay (content script, own React root,
-// hook-free data plane — see overlay/net.ts for why), the Pets nav panel
-// (den / hatchery / stats), and a slim settings section that points there.
+// Surfaces: the floating companion overlay (an app-wide overlay slot), the
+// Pets nav panel (den / hatchery / stats), and a slim settings section that
+// points there.
 import "./app.css";
 import { useEffect, useState } from "react";
-import { createRoot, type Root } from "react-dom/client";
 import { definePluginApp, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Overlay } from "./overlay/Overlay";
 import { PetsPanel } from "./panel/PetsPanel";
 import { rpc, type RpcOutput } from "./overlay/net";
+import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { Button } from "@/components/ui/button";
 
 /** bb's own compact breakpoint — the overlay never mounts below it. */
@@ -42,77 +42,44 @@ function PetsSettingsSection() {
   );
 }
 
+/**
+ * Mobile gate. perf-watch traced phone UI stalls to the overlay's rAF tick loop
+ * and per-tick DOM scans, so on compact viewports the Overlay must never
+ * render: every loop lives inside it, and a render-time blank would keep them
+ * running. The "Hide on small viewports" setting (default on) stays the single
+ * opt-back-in: a compact client renders the pet only after reading that the
+ * user turned it off, and fails closed when the read fails. Crossing the
+ * breakpoint (rotation, resize, a narrowed desktop window) re-decides live.
+ */
+function PetOverlayHost() {
+  const api = useRpc<typeof rpcContract>();
+  const compact = useMediaQuery(COMPACT_QUERY);
+  const [compactAllowed, setCompactAllowed] = useState(false);
+
+  useEffect(() => {
+    setCompactAllowed(false);
+    if (!compact) return;
+    let live = true;
+    rpc(api, "getOverlay")
+      .then((state) => {
+        if (live) setCompactAllowed(state.settings.hideOnCompact === false);
+      })
+      .catch(() => {
+        // Server unreachable: stay hidden on compact (fail closed).
+      });
+    return () => {
+      live = false;
+    };
+  }, [api, compact]);
+
+  if (compact && !compactAllowed) return null;
+  return <Overlay />;
+}
+
 export default definePluginApp((app) => {
-  app.contentScripts.register({
+  app.slots.experimental_appOverlay({
     id: "pet-overlay",
-    mount({ pluginId, signal }) {
-      // Mobile gate. perf-watch traced phone UI stalls to the overlay's rAF
-      // tick loop and per-tick DOM scans, so on compact viewports the overlay
-      // must never MOUNT — the render-time `hideOnCompact && compact` check
-      // inside Overlay only blanks the pet while every loop keeps running.
-      // The existing "Hide on small viewports" setting (default on) stays the
-      // single opt-back-in: a compact client mounts only when the user turned
-      // it off. Crossing the breakpoint (rotation, resize, a narrowed desktop
-      // window) re-decides live: going compact unmounts the React root and
-      // removes the container; going wide remounts cleanly.
-      const mql = window.matchMedia(COMPACT_QUERY);
-      let container: HTMLDivElement | null = null;
-      let root: Root | null = null;
-      let disposed = false;
-      // Monotonic guard for the compact branch's async settings read — a
-      // response that raced disposal or another breakpoint flip must not win.
-      let decideToken = 0;
-
-      const mountOverlay = () => {
-        if (disposed || root) return;
-        container = document.createElement("div");
-        container.setAttribute("data-bb-plugin-pets", "");
-        document.body.appendChild(container);
-        root = createRoot(container);
-        root.render(<Overlay pluginId={pluginId} />);
-      };
-
-      const unmountOverlay = () => {
-        root?.unmount();
-        container?.remove();
-        root = null;
-        container = null;
-      };
-
-      const decide = () => {
-        const token = ++decideToken;
-        if (!mql.matches) {
-          mountOverlay();
-          return;
-        }
-        // Compact: default to unmounted, then consult the stored setting for
-        // the explicit opt-in. getOverlay is read-only, and this one small
-        // fetch replaces the perpetual per-frame work the gate exists to stop.
-        unmountOverlay();
-        void rpc(pluginId, "getOverlay")
-          .then((state) => {
-            if (disposed || token !== decideToken || !mql.matches) return;
-            if (state.settings.hideOnCompact === false) mountOverlay();
-          })
-          .catch(() => {
-            // Server unreachable — stay unmounted on compact (fail closed).
-          });
-      };
-
-      const onBreakpointChange = () => decide();
-      mql.addEventListener("change", onBreakpointChange);
-      decide();
-
-      const dispose = () => {
-        if (disposed) return;
-        disposed = true;
-        decideToken += 1;
-        mql.removeEventListener("change", onBreakpointChange);
-        unmountOverlay();
-      };
-      signal.addEventListener("abort", dispose, { once: true });
-      return dispose;
-    },
+    component: PetOverlayHost,
   });
 
   app.slots.navPanel({

@@ -1,10 +1,10 @@
 // bb-plugin-pets — backend.
 //
 // Owns the den (SQLite), the XP ledger, fleet state, sprite serving, and
-// (M3) the hatch/evolve generation pipeline. The overlay in app.tsx is a
-// hook-free content script: it reads via rpc fetch and listens on the "pets"
-// realtime channel, so everything stateful lives here — XP accrues and fleet
-// state stays warm even with zero windows open.
+// (M3) the hatch/evolve generation pipeline. The overlay in app.tsx is an
+// app-wide overlay slot: it reads via rpc and listens on the "pets" realtime
+// channel, so everything stateful lives here — XP accrues and fleet state
+// stays warm even with zero windows open.
 import { randomUUID } from "node:crypto";
 import {
   copyFileSync,
