@@ -1,4 +1,5 @@
-// The floating companion. Hook-free data plane (see net.ts); React renders
+// The floating companion, mounted app-wide through experimental_appOverlay.
+// Data comes through SDK hooks (see net.ts); React renders
 // structure while one rAF loop drives locomotion, physics, and frame stepping
 // through refs. Sprites draw onto a canvas — pixel-exact source rects, so
 // adjacent frames can never bleed (CSS background-position sprites leak at
@@ -24,13 +25,15 @@ import {
 import { resolveState, type SpriteState } from "../src/atlas";
 import { EMOTION_LABELS, charGeometry, nextFrame, randomBetween } from "./core";
 import {
-  connectSignals,
-  currentThreadId,
-  navigateToThread,
-  rpc,
-  watchRoute,
-  type RpcOutput,
-} from "./net";
+  experimental_usePluginId,
+  useBbContext,
+  useBbNavigate,
+  useRealtime,
+  useRealtimeConnectionState,
+  useRpc,
+} from "@get-bb/plugin-sdk/app";
+import type { rpcContract } from "../server";
+import { rpc, type PetsRpc, type RpcOutput } from "./net";
 import { pickLine, type AmbientContext } from "./personality";
 import { setSoundVolume, setSoundsEnabled, setVoiceSeed, sounds, unlockSounds } from "./sounds";
 
@@ -315,7 +318,7 @@ function readAmbient(payload: unknown): AmbientContext {
 // The ambient-context method is added by the server half of this feature; call
 // it through a loose signature so this file compiles either way.
 const looseRpc = rpc as unknown as (
-  pluginId: string,
+  client: PetsRpc,
   method: string,
   input?: unknown,
 ) => Promise<unknown>;
@@ -708,10 +711,13 @@ function EvolutionCeremony({
   );
 }
 
-export function Overlay({ pluginId }: { pluginId: string }) {
+export function Overlay() {
+  const api = useRpc<typeof rpcContract>();
+  const pluginId = experimental_usePluginId();
+  const navigate = useBbNavigate();
+  const { threadId: viewedThreadId } = useBbContext();
   const [data, setData] = useState<OverlayData | null>(null);
   const [fleet, setFleet] = useState<Fleet | null>(null);
-  const [viewedThreadId, setViewedThreadId] = useState<string | null>(currentThreadId());
   const [spriteState, setSpriteState] = useState<SpriteState>("wave");
   const [bubble, setBubble] = useState<BubbleState | null>(null);
   // Measured placement for the live bubble: which side its tail hangs off, and
@@ -1059,13 +1065,37 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     momentRef.current = { state: "love", until: Date.now() + 1400 };
     hop(210);
     sounds.pet();
-    void rpc(pluginId, "petPet", { petId: pet.id }).catch(() => {});
-  }, [burstHearts, hop, pluginId]);
+    void rpc(api, "petPet", { petId: pet.id }).catch(() => {});
+  }, [burstHearts, hop, api]);
 
+  // bb's navigation API has no settings route, so the Settings item still
+  // pushes the path itself. Everything else goes through useBbNavigate.
   const navigateTo = useCallback((path: string) => {
     history.pushState({}, "", path);
     window.dispatchEvent(new PopStateEvent("popstate"));
   }, []);
+
+  // Stable across renders, so the many callbacks that open a thread never need
+  // it in their dependency lists.
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
+  const openThread = useCallback((threadId: string) => {
+    navigateRef.current.toThread(threadId);
+  }, []);
+
+  // Realtime: useRealtime keeps one subscription to the "pets" channel for the
+  // overlay's lifetime; the data-wiring effect below installs the handler.
+  // After a dropped connection comes back, durable state is refetched.
+  const signalHandlerRef = useRef<((payload: unknown) => void) | null>(null);
+  const reconnectRef = useRef<(() => void) | null>(null);
+  useRealtime("pets", (payload) => signalHandlerRef.current?.(payload));
+  const connection = useRealtimeConnectionState();
+  const lastConnectionRef = useRef(connection);
+  useEffect(() => {
+    const previous = lastConnectionRef.current;
+    lastConnectionRef.current = connection;
+    if (connection === "connected" && previous === "reconnecting") reconnectRef.current?.();
+  }, [connection]);
 
   // Staleness handshake. The stamp is added by the server half of this
   // feature, so it is read through a widened view (same idiom as
@@ -1089,7 +1119,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
   );
 
   const refetch = useCallback(() => {
-    return rpc(pluginId, "getOverlay").then((next) => {
+    return rpc(api, "getOverlay").then((next) => {
       setData(next);
       setFleet(next.fleet);
       setSoundsEnabled(next.settings.sounds);
@@ -1111,7 +1141,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       // reads the new stage off it) don't have to race the state update.
       return next;
     });
-  }, [pluginId, checkBundleStamp]);
+  }, [api, checkBundleStamp]);
 
   const refetchQuiet = useCallback(() => {
     void refetch().catch(() => {});
@@ -1119,14 +1149,14 @@ export function Overlay({ pluginId }: { pluginId: string }) {
 
   const persistPrefs = useCallback(() => {
     const pos = posRef.current;
-    void rpc(pluginId, "setOverlayPrefs", {
+    void rpc(api, "setOverlayPrefs", {
       x: pos.x === null ? null : Math.min(1, Math.max(0, pos.x / window.innerWidth)),
       y: pos.parked ? Math.round(pos.yBottom) : null,
       // Sizing is per-pet now (pet.sizeScale); the global scale is vestigial.
       scale: 1,
       parked: pos.parked,
     }).catch(() => {});
-  }, [pluginId]);
+  }, [api]);
 
   const startMission = useCallback(
     (thread: FleetThreadView) => {
@@ -1160,7 +1190,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
   );
 
   const pointAtAttention = useCallback(() => {
-    void rpc(pluginId, "getAttentionThreads")
+    void rpc(api, "getAttentionThreads")
       .then(({ threads }) => {
         const target = threads[0];
         // Manual pointing ignores the memory, but still stamps it: an explicit
@@ -1172,17 +1202,17 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         else showBubble("Nothing needs you. Enjoy it while it lasts.", { important: true });
       })
       .catch(() => {});
-  }, [pluginId, showBubble, startMission]);
+  }, [api, showBubble, startMission]);
 
   const fetchLatestFailure = useCallback(() => {
-    void rpc(pluginId, "getAttentionThreads")
+    void rpc(api, "getAttentionThreads")
       .then(({ threads }) => {
         const failed = threads.find((thread) => thread.status === "failed");
-        if (failed) navigateToThread(failed.projectId, failed.id);
+        if (failed) openThread(failed.id);
         else showBubble("No failures. Frame this moment.", { important: true });
       })
       .catch(() => {});
-  }, [pluginId, showBubble]);
+  }, [api, showBubble]);
 
   // Optimistic locally, debounced to the server — shared by the wheel gesture
   // and the menu's size row so both agree on clamping and write cadence.
@@ -1197,10 +1227,10 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       if (sizeSaveRef.current) clearTimeout(sizeSaveRef.current);
       sizeSaveRef.current = setTimeout(() => {
         sizeSaveRef.current = null;
-        void rpc(pluginId, "setPetSize", { petId, scale: next }).catch(() => {});
+        void rpc(api, "setPetSize", { petId, scale: next }).catch(() => {});
       }, 400);
     },
-    [pluginId],
+    [api],
   );
 
   /**
@@ -1615,205 +1645,199 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         if (!controller.signal.aborted) refetchQuiet();
       }, 1500);
     });
-    watchRoute((threadId) => setViewedThreadId(threadId), controller.signal);
-    connectSignals({
-      pluginId,
-      channel: "pets",
-      signal: controller.signal,
-      onReconnect: refetchQuiet,
-      onSignal: (payload) => {
-        const signal = payload as {
-          kind?: string;
-          fleet?: Fleet;
-          moment?: "celebrate" | "sad";
-          threadId?: string;
-          title?: string;
-          amount?: number;
-          xp?: number;
-          stageIndex?: number;
-          stageName?: string;
-          evolved?: boolean;
-          petId?: string;
-          source?: string;
-          /** treat-drop: horizontal landing spot, as a 0..1 fraction. */
-          x?: number;
-          /** treat-earned: the wallet's new balance. */
-          balance?: number;
-        };
-        lastActivityRef.current = Date.now();
-        switch (signal.kind) {
-          case "fleet":
-            if (signal.fleet) {
-              setFleet(signal.fleet);
-              checkLongRunners(signal.fleet);
-            }
-            checkBundleStamp((payload as { bundleStamp?: unknown }).bundleStamp);
-            break;
-          // A plugin reload restarts the server without closing this socket,
-          // so the boot announce is the only stamp that arrives on reload.
-          case "server-boot":
-            checkBundleStamp((payload as { bundleStamp?: unknown }).bundleStamp);
-            break;
-          case "job":
-            jobActiveRef.current = !!(payload as { job?: unknown }).job;
-            break;
-          case "moment": {
-            if (!signal.moment) break;
-            logDebug("signal", signal.moment);
-            // Tally what happened while the window was in the background; the
-            // digest lands when the user comes back.
-            if (document.hidden) {
-              if (signal.moment === "celebrate") awayCountsRef.current.completed += 1;
-              else if (signal.moment === "sad") awayCountsRef.current.failed += 1;
-            }
-            if (nappingRef.current) break;
-            const behavior = dataRef.current?.settings;
-            if (signal.moment === "sad") {
-              if (!(behavior?.reactFailures ?? true)) break;
-              // Failure startle: flinch first, settle into sad a beat later.
-              momentRef.current = { state: "startled", until: Date.now() + 900 };
-              setTimeout(() => {
-                momentRef.current = { state: "sad", until: Date.now() + 1900 };
-              }, 900);
-              sounds.womp();
-              if (signal.title) {
-                showBubble(`“${signal.title}” failed. We blame the tooling.`, {
-                  threadId: signal.threadId,
-                });
-              }
-            } else if (behavior?.reactTurnComplete ?? true) {
-              // An ordinary finished turn is the baseline, not a landmark.
-              celebrateTier("standard");
-            }
-            break;
+    reconnectRef.current = refetchQuiet;
+    signalHandlerRef.current = (payload) => {
+      const signal = payload as {
+        kind?: string;
+        fleet?: Fleet;
+        moment?: "celebrate" | "sad";
+        threadId?: string;
+        title?: string;
+        amount?: number;
+        xp?: number;
+        stageIndex?: number;
+        stageName?: string;
+        evolved?: boolean;
+        petId?: string;
+        source?: string;
+        /** treat-drop: horizontal landing spot, as a 0..1 fraction. */
+        x?: number;
+        /** treat-earned: the wallet's new balance. */
+        balance?: number;
+      };
+      lastActivityRef.current = Date.now();
+      switch (signal.kind) {
+        case "fleet":
+          if (signal.fleet) {
+            setFleet(signal.fleet);
+            checkLongRunners(signal.fleet);
           }
-          case "xp": {
-            // Daily turn milestones, counted client-side against local midnight.
-            if (signal.source === "turn-completed") {
-              const key = new Date().toDateString();
-              const tracker = turnsTodayRef.current;
-              if (tracker.key !== key) {
-                tracker.key = key;
-                tracker.count = 0;
-              }
-              tracker.count += 1;
-              if (tracker.count % 10 === 0) {
-                // A round-number day IS a landmark — this is the loud one.
-                celebrateTier("major");
-                showBubble(`${tracker.count} turns today. Carried.`, { important: false });
-              }
-            }
-            setData((prev) => {
-              if (!prev?.pet || prev.pet.id !== signal.petId) return prev;
-              return {
-                ...prev,
-                pet: {
-                  ...prev.pet,
-                  xp: signal.xp ?? prev.pet.xp,
-                  stage: signal.stageName
-                    ? {
-                        ...prev.pet.stage,
-                        index: signal.stageIndex ?? prev.pet.stage.index,
-                        name: signal.stageName,
-                      }
-                    : prev.pet.stage,
-                },
-              };
-            });
-            if (signal.evolved && signal.stageName) {
-              // The signal only carries the new stage name; nextStage targets,
-              // artBehind (the Glow-up item) and the rest live on the row the
-              // server is still settling. Refetch once it has — and hand the
-              // fresh row straight to the ceremony, which needs the pet's name
-              // and epithet, not just the stage label.
-              //
-              // `signal.evolved` is the server's stage-INCREASE flag, so an
-              // ordinary refetch or a reconnect can never land here.
-              if (ceremonyTimer) clearTimeout(ceremonyTimer);
-              ceremonyTimer = setTimeout(() => {
-                ceremonyTimer = null;
-                void refetch()
-                  .then((next) => {
-                    if (controller.signal.aborted || !next.pet) return;
-                    if (!(next.settings.evolutionCeremony ?? true)) return;
-                    // Replacing the whole object (new key) swaps any ceremony
-                    // still on screen instead of stacking a second one.
-                    setCeremony({
-                      name: next.pet.name,
-                      stageName: next.pet.stage.name,
-                      epithet: next.pet.stage.epithet,
-                      key: Date.now(),
-                    });
-                  })
-                  .catch(() => {});
-              }, 800);
-            }
-            if (
-              signal.evolved &&
-              signal.stageName &&
-              (dataRef.current?.settings.evolutionCeremony ?? true)
-            ) {
-              // Evolution ceremony: freeze into celebrate, glow, sparkle burst,
-              // hop, fanfare — then the bubble lands the news.
-              momentRef.current = { state: "dance", until: Date.now() + 4200 };
-              setEvolving(true);
-              setTimeout(() => setEvolving(false), 4200);
-              burstSparkles();
-              burstConfetti();
-              hop(300);
-              sounds.evolve();
-              const stageName = signal.stageName;
-              setTimeout(
-                () => showBubble(`Evolved. ${stageName} now. Act natural.`, { important: true }),
-                700,
-              );
-            } else if (
-              typeof signal.amount === "number" &&
-              signal.amount >= 10 &&
-              (dataRef.current?.settings.xpMotes ?? true)
-            ) {
-              const id = particleSeq++;
-              setMotes((prev) => [...prev.slice(-3), { id, text: `+${signal.amount}` }]);
-              setTimeout(() => setMotes((prev) => prev.filter((m) => m.id !== id)), 1500);
-            }
-            break;
+          checkBundleStamp((payload as { bundleStamp?: unknown }).bundleStamp);
+          break;
+        // A plugin reload restarts the server without closing this socket,
+        // so the boot announce is the only stamp that arrives on reload.
+        case "server-boot":
+          checkBundleStamp((payload as { bundleStamp?: unknown }).bundleStamp);
+          break;
+        case "job":
+          jobActiveRef.current = !!(payload as { job?: unknown }).job;
+          break;
+        case "moment": {
+          if (!signal.moment) break;
+          logDebug("signal", signal.moment);
+          // Tally what happened while the window was in the background; the
+          // digest lands when the user comes back.
+          if (document.hidden) {
+            if (signal.moment === "celebrate") awayCountsRef.current.completed += 1;
+            else if (signal.moment === "sad") awayCountsRef.current.failed += 1;
           }
-          case "glowup-available":
-            // Fresh artwork for the current stage is available but not applied:
-            // the pet mentions it, and the menu does the rest. Never talks over
-            // a bubble that's already up.
-            if (signal.stageName && !bubbleVisibleRef.current) {
-              showBubble(`i can look like a proper ${signal.stageName} now. glow up is in my menu.`, {
-                important: false,
+          if (nappingRef.current) break;
+          const behavior = dataRef.current?.settings;
+          if (signal.moment === "sad") {
+            if (!(behavior?.reactFailures ?? true)) break;
+            // Failure startle: flinch first, settle into sad a beat later.
+            momentRef.current = { state: "startled", until: Date.now() + 900 };
+            setTimeout(() => {
+              momentRef.current = { state: "sad", until: Date.now() + 1900 };
+            }, 900);
+            sounds.womp();
+            if (signal.title) {
+              showBubble(`“${signal.title}” failed. We blame the tooling.`, {
+                threadId: signal.threadId,
               });
             }
-            break;
-          case "treat-earned":
-            if (typeof signal.balance === "number") setTreatBalance(signal.balance);
-            // Never talk over something the pet is already saying.
-            if (!bubbleVisibleRef.current) showBubble("treat earned. i saw it first.");
-            break;
-          case "treat-drop": {
-            if (typeof signal.balance === "number") setTreatBalance(signal.balance);
-            const fraction = typeof signal.x === "number" ? signal.x : Math.random();
-            dropTreatAt(fraction);
-            break;
+          } else if (behavior?.reactTurnComplete ?? true) {
+            // An ordinary finished turn is the baseline, not a landmark.
+            celebrateTier("standard");
           }
-          case "hatched":
-            sounds.hatch();
-            burstSparkles();
-            refetchQuiet();
-            break;
-          case "evolved-art":
-          case "pet-changed":
-          case "settings-changed":
-            refetchQuiet();
-            break;
-          default:
-            break;
+          break;
         }
-      },
-    });
+        case "xp": {
+          // Daily turn milestones, counted client-side against local midnight.
+          if (signal.source === "turn-completed") {
+            const key = new Date().toDateString();
+            const tracker = turnsTodayRef.current;
+            if (tracker.key !== key) {
+              tracker.key = key;
+              tracker.count = 0;
+            }
+            tracker.count += 1;
+            if (tracker.count % 10 === 0) {
+              // A round-number day IS a landmark — this is the loud one.
+              celebrateTier("major");
+              showBubble(`${tracker.count} turns today. Carried.`, { important: false });
+            }
+          }
+          setData((prev) => {
+            if (!prev?.pet || prev.pet.id !== signal.petId) return prev;
+            return {
+              ...prev,
+              pet: {
+                ...prev.pet,
+                xp: signal.xp ?? prev.pet.xp,
+                stage: signal.stageName
+                  ? {
+                      ...prev.pet.stage,
+                      index: signal.stageIndex ?? prev.pet.stage.index,
+                      name: signal.stageName,
+                    }
+                  : prev.pet.stage,
+              },
+            };
+          });
+          if (signal.evolved && signal.stageName) {
+            // The signal only carries the new stage name; nextStage targets,
+            // artBehind (the Glow-up item) and the rest live on the row the
+            // server is still settling. Refetch once it has — and hand the
+            // fresh row straight to the ceremony, which needs the pet's name
+            // and epithet, not just the stage label.
+            //
+            // `signal.evolved` is the server's stage-INCREASE flag, so an
+            // ordinary refetch or a reconnect can never land here.
+            if (ceremonyTimer) clearTimeout(ceremonyTimer);
+            ceremonyTimer = setTimeout(() => {
+              ceremonyTimer = null;
+              void refetch()
+                .then((next) => {
+                  if (controller.signal.aborted || !next.pet) return;
+                  if (!(next.settings.evolutionCeremony ?? true)) return;
+                  // Replacing the whole object (new key) swaps any ceremony
+                  // still on screen instead of stacking a second one.
+                  setCeremony({
+                    name: next.pet.name,
+                    stageName: next.pet.stage.name,
+                    epithet: next.pet.stage.epithet,
+                    key: Date.now(),
+                  });
+                })
+                .catch(() => {});
+            }, 800);
+          }
+          if (
+            signal.evolved &&
+            signal.stageName &&
+            (dataRef.current?.settings.evolutionCeremony ?? true)
+          ) {
+            // Evolution ceremony: freeze into celebrate, glow, sparkle burst,
+            // hop, fanfare — then the bubble lands the news.
+            momentRef.current = { state: "dance", until: Date.now() + 4200 };
+            setEvolving(true);
+            setTimeout(() => setEvolving(false), 4200);
+            burstSparkles();
+            burstConfetti();
+            hop(300);
+            sounds.evolve();
+            const stageName = signal.stageName;
+            setTimeout(
+              () => showBubble(`Evolved. ${stageName} now. Act natural.`, { important: true }),
+              700,
+            );
+          } else if (
+            typeof signal.amount === "number" &&
+            signal.amount >= 10 &&
+            (dataRef.current?.settings.xpMotes ?? true)
+          ) {
+            const id = particleSeq++;
+            setMotes((prev) => [...prev.slice(-3), { id, text: `+${signal.amount}` }]);
+            setTimeout(() => setMotes((prev) => prev.filter((m) => m.id !== id)), 1500);
+          }
+          break;
+        }
+        case "glowup-available":
+          // Fresh artwork for the current stage is available but not applied:
+          // the pet mentions it, and the menu does the rest. Never talks over
+          // a bubble that's already up.
+          if (signal.stageName && !bubbleVisibleRef.current) {
+            showBubble(`i can look like a proper ${signal.stageName} now. glow up is in my menu.`, {
+              important: false,
+            });
+          }
+          break;
+        case "treat-earned":
+          if (typeof signal.balance === "number") setTreatBalance(signal.balance);
+          // Never talk over something the pet is already saying.
+          if (!bubbleVisibleRef.current) showBubble("treat earned. i saw it first.");
+          break;
+        case "treat-drop": {
+          if (typeof signal.balance === "number") setTreatBalance(signal.balance);
+          const fraction = typeof signal.x === "number" ? signal.x : Math.random();
+          dropTreatAt(fraction);
+          break;
+        }
+        case "hatched":
+          sounds.hatch();
+          burstSparkles();
+          refetchQuiet();
+          break;
+        case "evolved-art":
+        case "pet-changed":
+        case "settings-changed":
+          refetchQuiet();
+          break;
+        default:
+          break;
+      }
+    };
     return () => {
       controller.abort();
       if (retryTimer) clearTimeout(retryTimer);
@@ -1827,7 +1851,6 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     checkLongRunners,
     dropTreatAt,
     hop,
-    pluginId,
     refetch,
     refetchQuiet,
     showBubble,
@@ -1994,7 +2017,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         schedule();
         return;
       }
-      void rpc(pluginId, "listDen")
+      void rpc(api, "listDen")
         .then((result) => {
           if (cancelled) return;
           const others = result.pets.filter((entry) => !entry.active);
@@ -2014,7 +2037,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [pluginId, reducedMotion]);
+  }, [api, reducedMotion]);
 
   // Bubble expiry.
   useEffect(() => {
@@ -2517,7 +2540,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
             sounds.pet();
             buffUntilRef.current = playNow + TREAT_BUFF_MS;
             nextBuffSparkleRef.current = playNow;
-            void looseRpc(pluginId, "eatTreat").catch(() => {});
+            void looseRpc(api, "eatTreat").catch(() => {});
             syncTreats();
             logDebug("treat", "eaten");
           } else {
@@ -2617,7 +2640,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
           ball.yBottom = terrainAt(pos.x + width / 2);
           fetchActiveRef.current = false;
           celebrateTier("minor");
-          void looseRpc(pluginId, "recordFetch").catch(() => {});
+          void looseRpc(api, "recordFetch").catch(() => {});
           if (Math.random() < 0.3) showBubble("again.");
           // Hand the LIVE position to React alongside the fade, so the re-render
           // can't snap the ball back to where it was thrown from.
@@ -2935,7 +2958,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     nudgeOffLedge,
     persistPrefs,
     playTimeout,
-    pluginId,
+    api,
     pulseClass,
     reducedMotion,
     showBubble,
@@ -3145,7 +3168,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       if (flavors.length === 0) return;
       let ctx: AmbientContext;
       try {
-        ctx = readAmbient(await looseRpc(pluginId, "getAmbientContext"));
+        ctx = readAmbient(await looseRpc(api, "getAmbientContext"));
       } catch {
         return;
       }
@@ -3403,7 +3426,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
     data?.pet?.id,
     data?.settings.enabled,
     burstSparkles,
-    pluginId,
+    api,
     pulseClass,
     reducedMotion,
     showBubble,
@@ -3470,9 +3493,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         ?.closest("[data-sidebar-thread-id]");
       const droppedThreadId = row?.getAttribute("data-sidebar-thread-id");
       if (droppedThreadId) {
-        const thread = fleetRef.current?.threads.find((t) => t.id === droppedThreadId);
-        if (thread) navigateToThread(thread.projectId, thread.id);
-        else navigateTo(`/threads/${droppedThreadId}`);
+        openThread(droppedThreadId);
         momentRef.current = { state: "celebrate", until: Date.now() + 1400 };
         sounds.pet();
         pos.parked = false;
@@ -3529,7 +3550,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
         missionRef.current = null;
         lastHighlightRectRef.current = null;
         setHighlight(null);
-        navigateToThread(pointing.thread.projectId, pointing.thread.id);
+        openThread(pointing.thread.id);
         return;
       }
       petThePet();
@@ -3552,9 +3573,9 @@ export function Overlay({ pluginId }: { pluginId: string }) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
     }
-    void rpc(pluginId, "getNeediestThread")
+    void rpc(api, "getNeediestThread")
       .then(({ thread }) => {
-        if (thread) navigateToThread(thread.projectId, thread.id);
+        if (thread) openThread(thread.id);
         else showBubble("Nothing needs you. Suspicious.", { important: true });
       })
       .catch(() => {});
@@ -3662,7 +3683,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
               style={bubbleFit ? { left: bubbleFit.left, right: "auto" } : undefined}
               onClick={() => {
                 if (bubble.threadId && bubble.projectId) {
-                  navigateToThread(bubble.projectId, bubble.threadId);
+                  openThread(bubble.threadId);
                 }
                 setBubble(null);
               }}
@@ -3780,12 +3801,12 @@ export function Overlay({ pluginId }: { pluginId: string }) {
               }
               dragRef.current = null;
               setGrabbed(false);
-              void rpc(pluginId, "listDen")
+              void rpc(api, "listDen")
                 .then((result) => setDen(result.pets))
                 .catch(() => {});
               // Treat wallet, loaded alongside the den. Silent on failure: the
               // server half may not be there yet, and the menu still works.
-              void looseRpc(pluginId, "getTreats")
+              void looseRpc(api, "getTreats")
                 .then((result) => {
                   const balance = (result as { balance?: unknown } | null)?.balance;
                   if (typeof balance === "number") setTreatBalance(balance);
@@ -3899,7 +3920,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
                 // The drop itself is driven by the server's treat-drop signal;
                 // this only spends the treat.
                 setTreatBalance((prev) => Math.max(0, prev - 1));
-                void looseRpc(pluginId, "dropTreat")
+                void looseRpc(api, "dropTreat")
                   .then((result) => {
                     const balance = (result as { balance?: unknown } | null)?.balance;
                     if (typeof balance === "number") setTreatBalance(balance);
@@ -3932,7 +3953,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
                     <ContextMenuItem
                       key={entry.id}
                       disabled={entry.active}
-                      onSelect={guardedSelect(() => void rpc(pluginId, "selectPet", { petId: entry.id }).catch(() => {}))}
+                      onSelect={guardedSelect(() => void rpc(api, "selectPet", { petId: entry.id }).catch(() => {}))}
                     >
                       {entry.active ? "→ " : ""}
                       {entry.name} · {entry.stage.name}
@@ -3941,13 +3962,13 @@ export function Overlay({ pluginId }: { pluginId: string }) {
                 </ContextMenuSubContent>
               </ContextMenuSub>
             ) : null}
-            <ContextMenuItem onSelect={guardedSelect(() => navigateTo(`/plugins/${pluginId}/pets/hatchery`))}>
+            <ContextMenuItem onSelect={guardedSelect(() => navigate.toPluginPanel("pets", { subPath: "hatchery" }))}>
               Hatch a new pet…
             </ContextMenuItem>
             {pet.artBehind && data.hasApiKey ? (
               <ContextMenuItem
                 onSelect={guardedSelect(() => {
-                  void rpc(pluginId, "evolveArt", { petId: pet.id })
+                  void rpc(api, "evolveArt", { petId: pet.id })
                     .then(() => showBubble("New look incoming…", { important: true }))
                     .catch((error: Error) => showBubble(error.message, { important: true }));
                 })}
@@ -3983,7 +4004,7 @@ export function Overlay({ pluginId }: { pluginId: string }) {
             <ContextMenuItem onSelect={guardedSelect(() => setSessionHidden(true))}>Hide until reload</ContextMenuItem>
             <ContextMenuSeparator />
             <ContextMenuItem onSelect={guardedSelect(startTour)}>Show me around</ContextMenuItem>
-            <ContextMenuItem onSelect={guardedSelect(() => navigateTo(`/plugins/${pluginId}/pets`))}>
+            <ContextMenuItem onSelect={guardedSelect(() => navigate.toPluginPanel("pets"))}>
               Open Pets panel
             </ContextMenuItem>
             <ContextMenuItem onSelect={guardedSelect(() => navigateTo(`/settings/plugins/${pluginId}`))}>
