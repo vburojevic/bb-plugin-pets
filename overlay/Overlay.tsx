@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/context-menu";
 import { resolveState, type SpriteState } from "../src/atlas";
 import { EMOTION_LABELS, charGeometry, nextFrame, randomBetween } from "./core";
+import { ledgeBands } from "./terrain";
 import {
   experimental_usePluginId,
   useBbContext,
@@ -109,7 +110,9 @@ const COMPOSER_POLL_MS = 250;
 const COMPOSER_PAD = 16;
 // --- terrain ---
 // The composer is a ledge: the pet climbs onto its top edge instead of walking
-// through it. Never climb higher than this, no matter what a bad measurement says.
+// through it. Never climb higher than this, no matter what a bad measurement
+// says. A composer entirely above it (the new-thread page puts it at the top of
+// the window) is not terrain at all.
 const LEDGE_MAX = GROUND_PX + 260;
 // Vertical travel while stepping up onto / down off the ledge.
 const LEDGE_CLIMB_SPEED = 620;
@@ -1234,11 +1237,9 @@ export function Overlay() {
   );
 
   /**
-   * The composers as terrain: each visual card, approximated by expanding the
-   * input's own rect (the card's padding/border live outside the textarea).
-   * One band per pane — split panes each get their own ledge. Throttled — this
-   * is a layout read the loop can't afford every frame — and shared with the
-   * ghosting safety net below.
+   * The composers as terrain (see ledgeBands): one band per pane, so split
+   * panes each get their own ledge, and none for a composer entirely out of reach.
+   * Throttled: this is a layout read the loop can't afford every frame.
    */
   const composerBands = useCallback((): Array<{ left: number; right: number; top: number }> => {
     const now = performance.now();
@@ -1246,11 +1247,7 @@ export function Overlay() {
       composerStampRef.current = now;
       composerRectsRef.current = composerRects();
     }
-    return composerRectsRef.current.map((rect) => ({
-      left: rect.left - 12,
-      right: rect.right + 12,
-      top: rect.top - 10,
-    }));
+    return ledgeBands(composerRectsRef.current, window.innerHeight, LEDGE_MAX);
   }, []);
 
   /**
@@ -1916,6 +1913,9 @@ export function Overlay() {
   useEffect(() => {
     const onResize = () => {
       setCompact(window.innerWidth < 768);
+      // Re-measure the composers next tick: stale rects against the new height
+      // would drop or misplace the ledge the pet is standing on.
+      composerStampRef.current = 0;
       const pos = posRef.current;
       pos.yBottom = Math.min(pos.yBottom, Math.max(GROUND_PX, window.innerHeight - 120));
     };
