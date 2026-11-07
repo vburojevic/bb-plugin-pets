@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0 — 2026-11-07
+
+Requires bb 0.49 or later. bb installs from git skip tags whose engines don't match, so older bb stays on 0.2.4.
+
+### Changed
+
+- **Current bb plugin SDK**: the plugin now builds against the `@get-bb/plugin-sdk` npm package (0.6.132) instead of vendored types. `engines.bb` is `>=0.49` and `engines.bbPluginSdk` is `>=0.6.132`. The frontend packages bb shims at runtime are type-only dev dependencies now, so a git install pulls 37 packages instead of 69. (#4)
+- **The overlay is an app overlay slot**: the floating pet mounts through `app.slots.experimental_appOverlay` and reads through bb's SDK hooks (`useRpc`, `useRealtime`, `useBbContext`, `useBbNavigate`). It no longer opens its own WebSocket, patches the history API to watch routes, or fakes `popstate` to navigate. Behavior is unchanged, including the compact-viewport gate. (#5)
+- **README**: redesigned with light and dark screenshots and GIFs captured on bb 0.49. (#6)
+
+### Fixed
+
+- **Install guard**: a test walks the server and app import graphs and fails if a runtime package is missing from `dependencies`, so the 0.2.1 `zod` install break cannot come back unnoticed. (#3)
+
+## 0.2.4 — 2026-09-05
+
+### Changed
+
+- Refresh the shipped frontend artifacts for the current bb runtime.
+
 ## 0.2.3 — 2026-08-28
 
 ### Fixed
